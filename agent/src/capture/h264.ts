@@ -3,6 +3,7 @@ import { Codec, CodecContext, Dictionary, Packet, Rational, type Frame } from "n
 import { platform } from "node:os";
 import {
   AV_PIX_FMT_YUV420P,
+  AV_PIX_FMT_NV12,
   AV_PICTURE_TYPE_I,
   AV_PICTURE_TYPE_NONE,
   FF_ENCODER_LIBX264,
@@ -183,6 +184,8 @@ export class H264Capture implements ScreenCapture {
   private running = false;
   /** Bumped on every (re)start so a superseded pump loop exits. */
   private generation = 0;
+  /** The in-flight pump, so a restart can wait for it to release the device. */
+  private pumpDone: Promise<void> | null = null;
   private width: number;
   private fps: number;
   private bitrateKbps: number;
@@ -203,7 +206,7 @@ export class H264Capture implements ScreenCapture {
   start(handler: FrameHandler): void {
     this.handler = handler;
     this.running = true;
-    void this.pump(++this.generation);
+    this.restart();
   }
 
   /**
@@ -215,7 +218,7 @@ export class H264Capture implements ScreenCapture {
     const fps = Math.min(60, Math.max(1, Math.round(1000 / ms)));
     if (fps === this.fps) return;
     this.fps = fps;
-    if (this.running) void this.pump(++this.generation);
+    if (this.running) this.restart();
   }
 
   /**
@@ -241,7 +244,7 @@ export class H264Capture implements ScreenCapture {
   setBitrate(kbps: number): void {
     if (kbps === this.bitrateKbps || kbps <= 0) return;
     this.bitrateKbps = kbps;
-    if (this.running) void this.pump(++this.generation);
+    if (this.running) this.restart();
   }
 
   /**
@@ -263,7 +266,7 @@ export class H264Capture implements ScreenCapture {
     if (w === this.width && f === this.fps) return;
     this.width = w;
     this.fps = f;
-    if (this.running) void this.pump(++this.generation);
+    if (this.running) this.restart();
   }
 
   /**
@@ -353,6 +356,25 @@ export class H264Capture implements ScreenCapture {
   }
 
   /**
+   * Supersedes the running pump and starts a fresh one.
+   *
+   * The new session waits for the old one to finish tearing down rather than
+   * opening alongside it. Two capture streams on the same display contend for
+   * it, so overlapping even briefly on every adaptation step is what turned a
+   * cheap restart into a frame-rate cliff.
+   */
+  private restart(): void {
+    const generation = ++this.generation;
+    const previous = this.pumpDone;
+    this.pumpDone = (async () => {
+      if (previous) await previous;
+      // Another restart (or a stop) landed while the old session was closing.
+      if (generation !== this.generation || !this.running) return;
+      await this.pump(generation);
+    })();
+  }
+
+  /**
    * Runs one capture -> scale -> encode session until superseded or stopped.
    *
    * Guarded by `generation` rather than a boolean so a restart (fps or bitrate
@@ -360,8 +382,23 @@ export class H264Capture implements ScreenCapture {
    * generation on its next frame and returns, leaving exactly one pump running.
    */
   private async pump(generation: number): Promise<void> {
+    let demuxer: Awaited<ReturnType<typeof DeviceAPI.openScreen>> | null = null;
+    let decoder: Decoder | null = null;
+    let filter: FilterAPI | null = null;
+    let ctx: CodecContext | null = null;
     try {
-      const demuxer = await DeviceAPI.openScreen({ frameRate: this.fps });
+      demuxer = await DeviceAPI.openScreen({
+        frameRate: this.fps,
+        // Ask for what the device actually produces. ScreenCaptureKit offers
+        // only nv12 and bgr0, so requesting yuv420p here made avfoundation
+        // override the choice on every open; the filter graph below converts
+        // to yuv420p anyway, which is where the conversion belongs.
+        pixelFormat: AV_PIX_FMT_NV12,
+        // Probe long enough to estimate the input frame rate. The default
+        // budget sees only a frame or two from a screen device that emits on
+        // change, so the rate came back unknown on every single open.
+        formatOptions: { probesize: 5_000_000, analyzeduration: 2_000_000 },
+      });
       const stream = demuxer.video();
       if (!stream) throw new Error("screen device exposed no video stream");
 
@@ -373,12 +410,12 @@ export class H264Capture implements ScreenCapture {
       const w = Math.trunc(Math.min(this.width, srcW) / 2) * 2;
       const h = Math.trunc((srcH * w) / srcW / 2) * 2;
 
-      const decoder = await Decoder.create(stream);
+      decoder = await Decoder.create(stream);
       // The filter graph does scaling and pixel-format conversion in one pass:
       // the screen device delivers nv12 (ScreenCaptureKit) or a packed RGB
       // variant depending on platform, and libx264 needs planar yuv420p.
-      const filter = FilterAPI.create(`scale=${w}:${h},format=yuv420p`);
-      const ctx = await this.openEncoder(w, h);
+      filter = FilterAPI.create(`scale=${w}:${h},format=yuv420p`);
+      ctx = await this.openEncoder(w, h);
       this.pts = 0n;
       // A new encoder's first frame must be an IDR, or the receiver has
       // nothing to start decoding from.
@@ -398,6 +435,20 @@ export class H264Capture implements ScreenCapture {
       if (generation === this.generation && this.running) {
         process.stderr.write(`[h264] capture failed: ${String(err)}\n`);
       }
+    } finally {
+      // Released in reverse order of acquisition, and unconditionally.
+      //
+      // Without this, every bitrate change leaked a live capture session: the
+      // superseded loop saw a stale generation and broke out of the frame
+      // iteration, but the device it opened kept streaming. With the adaptive
+      // controller stepping bitrate roughly every 2s, sessions accumulated
+      // until several ScreenCaptureKit streams were capturing the same display
+      // at once, contending for it — which is what dragged an intended 30fps
+      // down to single digits.
+      ctx?.freeContext();
+      filter?.close();
+      decoder?.close();
+      await demuxer?.close();
     }
   }
 
