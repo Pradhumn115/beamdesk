@@ -61,7 +61,7 @@ function fakeInput(recorded: string[]): InputController {
 }
 
 function fakeTyping(): TypingBackend {
-  return { async typeChar() {}, async backspace() {} };
+  return { async typeChar() {}, async backspace() {}, async pressEnter() {} };
 }
 
 function fakeClipboard(initial = ""): ClipboardBackend {

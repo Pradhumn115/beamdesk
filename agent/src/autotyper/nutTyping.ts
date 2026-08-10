@@ -17,5 +17,9 @@ export async function createNutTypingBackend(): Promise<TypingBackend> {
       await keyboard.pressKey(Key.Backspace);
       await keyboard.releaseKey(Key.Backspace);
     },
+    async pressEnter(): Promise<void> {
+      await keyboard.pressKey(Key.Enter);
+      await keyboard.releaseKey(Key.Enter);
+    },
   };
 }

@@ -11,6 +11,9 @@ function recorder() {
     async backspace() {
       events.push("<BS>");
     },
+    async pressEnter() {
+      events.push("<CR>");
+    },
   };
   return { events, backend };
 }
@@ -90,6 +93,38 @@ test("stops typing when the signal is aborted mid-run", async () => {
   );
   assert.equal(completed, false); // reported as cancelled
   assert.equal(events.join(""), "abc"); // stopped after the 3rd char
+});
+
+test("presses Enter for a newline instead of typing it as a character", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "one.\ntwo",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  // The line break must be a real Return press, otherwise "two" continues on
+  // the same line right after the period: "one.two".
+  assert.deepEqual(events, ["o", "n", "e", ".", "<CR>", "t", "w", "o"]);
+});
+
+test("treats CRLF as a single Enter press", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "a\r\nb",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  assert.deepEqual(events, ["a", "<CR>", "b"]);
+});
+
+test("never injects a typo in place of a line break", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "\n",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 1 },
+    { backend, sleep: noSleep, rng: () => 0 },
+  );
+  assert.deepEqual(events, ["<CR>"]);
 });
 
 test("returns true when it finishes without abort", async () => {

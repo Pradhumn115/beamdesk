@@ -4,6 +4,12 @@ import type { AutotypeProfile } from "@bcsa/shared";
 export interface TypingBackend {
   typeChar(ch: string): Promise<void>;
   backspace(): Promise<void>;
+  /**
+   * Press Return. Line breaks need a real key press: typing "\n" as a
+   * character emits a control code most apps ignore, which silently joins the
+   * next line onto the current one.
+   */
+  pressEnter(): Promise<void>;
 }
 
 export interface AutotypeHooks {
@@ -67,6 +73,19 @@ export async function runAutotype(
   for (let i = 0; i < text.length; i++) {
     if (deps.signal?.aborted) return false; // cancelled before this keystroke
     const ch = text[i];
+
+    // Line breaks are key presses, not characters. Swallow the CR of a CRLF
+    // pair so "\r\n" produces a single Return rather than two.
+    if (ch === "\r" && text[i + 1] === "\n") {
+      hooks.onProgress?.(i + 1, total);
+      continue;
+    }
+    if (ch === "\n" || ch === "\r") {
+      await deps.backend.pressEnter();
+      hooks.onProgress?.(i + 1, total);
+      if (i < text.length - 1) await sleep(delay());
+      continue;
+    }
 
     // Occasionally fumble: type an adjacent wrong key, then fix it.
     if (rng() < profile.typoRate) {
