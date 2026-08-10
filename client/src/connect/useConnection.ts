@@ -145,8 +145,8 @@ export interface UseConnection {
   diagnostics: DiagnosticsState;
   /** Live encode resolution/fps, or null if the agent has not reported any. */
   quality: QualityStatus | null;
-  /** Pin a streaming width, or pass null to hand quality back to Auto. */
-  setQuality: (width: number | null) => void;
+  /** Pin a streaming width (with its rung's fps), or null to return to Auto. */
+  setQuality: (width: number | null, fps?: number) => void;
   lastError: string | null;
   params: ConnectParams;
   connect: (params: ConnectParams) => void;
@@ -697,10 +697,10 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
   );
 
   const setQuality = useCallback(
-    (width: number | null) => {
+    (width: number | null, fps?: number) => {
       // No optimistic echo: the agent snaps the request to a real ladder rung,
       // so showing the requested width could differ from what is encoded.
-      send({ type: "setQuality", width });
+      send({ type: "setQuality", width, fps });
     },
     [send],
   );

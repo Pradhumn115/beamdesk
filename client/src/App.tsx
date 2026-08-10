@@ -329,19 +329,32 @@ export function App() {
               aria-label="Streaming resolution"
               // Auto is the empty value; a pinned rung shows its own width even
               // though the agent keeps reporting the live geometry.
-              value={conn.quality.mode === "auto" ? "" : String(conn.quality.width)}
-              onChange={(e) =>
-                conn.setQuality(e.target.value === "" ? null : Number(e.target.value))
+              value={
+                conn.quality.mode === "auto"
+                  ? ""
+                  : `${conn.quality.width}x${conn.quality.fps}`
               }
+              onChange={(e) => {
+                if (e.target.value === "") return conn.setQuality(null);
+                const [w, f] = e.target.value.split("x").map(Number);
+                conn.setQuality(w, f);
+              }}
             >
               <option value="">
                 Auto{conn.quality.mode === "auto" ? ` (${conn.quality.width}p)` : ""}
               </option>
-              {conn.quality.options.map((o) => (
-                <option key={`${o.width}x${o.fps}`} value={o.width}>
-                  {o.width}p{o.fps < 30 ? ` @ ${o.fps}fps` : ""}
-                </option>
-              ))}
+              {/* The ladder can hold two rungs at the same width but different
+                  fps (full-rate and 30fps), which would render as duplicate
+                  entries with the same value — the second unreachable. Label
+                  the fps whenever a width repeats. */}
+              {conn.quality.options.map((o, i, all) => {
+                const ambiguous = all.some((x, j) => j !== i && x.width === o.width);
+                return (
+                  <option key={`${o.width}x${o.fps}`} value={`${o.width}x${o.fps}`}>
+                    {o.width}p{ambiguous || o.fps < 30 ? ` @ ${o.fps}fps` : ""}
+                  </option>
+                );
+              })}
             </select>
             {conn.quality.buffering && (
               <span className="status-buffering" title="Holding your chosen resolution; the link is behind">

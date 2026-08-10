@@ -347,7 +347,6 @@ export class ConnectionServer {
    * drops fps long before reaching its narrowest rung.
    */
   private baselineWidth: number | null = null;
-  private baselineFps: number | null = null;
   /** "manual" once the viewer pins a rung; the ladder stops moving. */
   private qualityMode: "auto" | "manual" = "auto";
   /** The pinned geometry, when qualityMode is "manual". */
@@ -497,7 +496,6 @@ export class ConnectionServer {
   private rememberBaseline(): void {
     if (this.baselineWidth !== null) return;
     this.baselineWidth = this.deps.capture.encodeWidth ?? null;
-    this.baselineFps = this.deps.capture.encodeFps ?? null;
   }
 
   /**
@@ -509,11 +507,15 @@ export class ConnectionServer {
    * previous session ended on, so nothing ever stepped it back up.
    */
   private restoreBaselineQuality(): void {
-    if (this.baselineWidth === null || this.baselineFps === null) return;
-    if (!this.deps.capture.setScale) return;
-    this.deps.capture.setScale(this.baselineWidth, this.baselineFps);
+    if (this.baselineWidth === null || !this.deps.capture.setScale) return;
+    // Restore rung 0 itself rather than a remembered fps. The live encodeFps
+    // is mode-dependent -- a screenshot-mode session runs at well under 1fps,
+    // and latching THAT as the baseline stranded the next session at 1fps.
+    // Rung 0 is by definition what "full quality" means for this session.
+    const top = this.getLadder()[0];
+    this.deps.capture.setScale(top.width, top.fps);
     process.stderr.write(
-      `[adapt] quality reset -> ${this.baselineWidth}px @ ${this.baselineFps}fps (session ended)\n`,
+      `[adapt] quality reset -> ${top.width}px @ ${top.fps}fps (session ended)\n`,
     );
   }
 
@@ -610,6 +612,9 @@ export class ConnectionServer {
 
       this.bitrateKbps = next;
       this.deps.capture.setBitrate?.(next);
+      // The strip shows this number; without a report it freezes at whatever
+      // it was when the last rung change happened.
+      this.sendQualityState();
       process.stderr.write(
         `[adapt] ${previous} -> ${next} kbps ` +
           `(${congested ? `backlog ${(backlog / 1024).toFixed(0)}KB, ${drops} dropped` : "link healthy"})\n`,
