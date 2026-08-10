@@ -10,6 +10,18 @@ export interface TypingBackend {
    * next line onto the current one.
    */
   pressEnter(): Promise<void>;
+  /**
+   * Select from the caret back to the start of the line.
+   *
+   * Used to neutralise an editor's auto-indent: whatever it inserted after
+   * Return ends up selected, so the first character typed replaces it and the
+   * line lands at exactly the indentation the source text specifies.
+   *
+   * Optional because not every target can do it — a terminal may echo the key
+   * as an escape sequence rather than selecting — and a backend that omits it
+   * simply types without the guard.
+   */
+  selectToLineStart?(): Promise<void>;
 }
 
 export interface AutotypeHooks {
@@ -24,6 +36,34 @@ export interface AutotypeDeps {
   rng?: () => number;
   /** Abort to stop typing mid-run (checked between keystrokes). */
   signal?: AbortSignal;
+  /**
+   * Overrides the automatic decision described in looksIndented().
+   *
+   * Left undefined the guard turns itself on for text that carries its own
+   * indentation, which is the common case for pasted code and never applies to
+   * ordinary prose.
+   */
+  guardIndent?: boolean;
+}
+
+/**
+ * Whether `text` carries indentation the editor will fight over.
+ *
+ * An editor auto-indents each new line, and the source text then types its own
+ * leading whitespace on top, so the two add up. Worse, the editor bases its
+ * guess on the previous line — which is already doubled — so the error
+ * compounds and the block fans out into a pyramid:
+ *
+ *   def f():          <- correct
+ *       if x:         <- editor 4 + source 4  = 8
+ *               pass  <- editor 8 + source 8  = 16
+ *
+ * Detecting it is enough to decide: only text with an indented continuation
+ * line can be mangled this way, and for anything else the guard is a wasted
+ * keypress per line.
+ */
+export function looksIndented(text: string): boolean {
+  return /\n[ \t]+\S/.test(text);
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -64,6 +104,7 @@ export async function runAutotype(
   const sleep = deps.sleep ?? defaultSleep;
   const rng = deps.rng ?? Math.random;
   const total = text.length;
+  const guardIndent = deps.guardIndent ?? looksIndented(text);
 
   const delay = (): number => {
     const jitter = (rng() * 2 - 1) * profile.jitterMs;
@@ -82,6 +123,10 @@ export async function runAutotype(
     }
     if (ch === "\n" || ch === "\r") {
       await deps.backend.pressEnter();
+      // Select whatever the editor auto-inserted, so this line's own leading
+      // whitespace replaces it rather than stacking on top of it. Harmless
+      // when the editor inserted nothing: the selection is simply empty.
+      if (guardIndent) await deps.backend.selectToLineStart?.();
       hooks.onProgress?.(i + 1, total);
       if (i < text.length - 1) await sleep(delay());
       continue;
