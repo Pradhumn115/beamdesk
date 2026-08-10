@@ -252,6 +252,42 @@ body::after {
 .status-text { color: var(--text); }
 .status-sep { color: var(--line-strong); }
 .status-error { color: var(--danger); }
+/* Stepped below the session's starting resolution: a notice, not an error —
+   the controller climbs back on its own once the link recovers. */
+.status-degraded { color: var(--amber); }
+
+.quality-picker {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 1px 4px;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+.quality-picker:hover { border-color: var(--text); }
+
+/* Only reachable with a pinned resolution: the viewer chose latency over a
+   smaller picture, so this is informational rather than a warning. */
+.status-buffering {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--amber);
+}
+.status-buffering .spinner {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .status-buffering .spinner { animation: none; }
+}
 
 /* ---- Workspace ------------------------------------------------------------ */
 

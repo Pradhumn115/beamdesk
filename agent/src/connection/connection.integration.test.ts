@@ -424,3 +424,146 @@ test("getClipboard replies with the agent's clipboard text; setClipboard changes
   ws.close();
   await server.close();
 });
+
+/**
+ * A congested session must not leave the encoder small for the next one.
+ *
+ * The encoder is shared process-wide, so a session that walked the ladder down
+ * used to hand the next client a narrow picture while the controller reset its
+ * rung to 0 — "already at the top" — and nothing ever stepped it back up. The
+ * agent stayed degraded until it was restarted.
+ */
+test("restores the encoder to full quality when the session ends", async () => {
+  const scales: Array<{ width: number; fps: number }> = [];
+  const capture = fakeCapture();
+  const withHooks = capture as unknown as {
+    setBitrate: (k: number) => void;
+    setScale: (w: number, f: number) => void;
+    encodeWidth: number;
+    encodeFps: number;
+  };
+  withHooks.encodeWidth = 1280;
+  withHooks.encodeFps = 59;
+  withHooks.setBitrate = () => {};
+  withHooks.setScale = (width, fps) => {
+    scales.push({ width, fps });
+    // Mirror H264Capture: the live geometry follows the scale request, which
+    // is exactly what made reading it back to build the ladder unsafe.
+    withHooks.encodeWidth = width;
+    withHooks.encodeFps = fps;
+  };
+
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 59,
+    maxQueuedFrameBytes: -1, // permanently "behind", so it walks down
+    initialBitrateKbps: 700,
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+
+  await new Promise((r) => setTimeout(r, 9000));
+  const duringSession = scales.length;
+  assert.ok(duringSession > 0, "expected the congested link to step quality down");
+  assert.ok(withHooks.encodeWidth < 1280, "expected the encoder to be narrower mid-session");
+
+  ws.close();
+  await server.close();
+
+  const last = scales[scales.length - 1];
+  assert.deepEqual(
+    last,
+    { width: 1280, fps: 59 },
+    `expected a reset to the starting geometry, got ${JSON.stringify(last)}`,
+  );
+  assert.equal(withHooks.encodeWidth, 1280, "next session must start at full width");
+});
+
+/**
+ * A pinned resolution is the viewer's explicit choice and must not be
+ * overridden. Auto mode answers congestion by shrinking the picture; manual
+ * mode answers it by queueing frames, exactly as a video player buffers rather
+ * than silently switching you to 240p.
+ */
+test("a pinned resolution survives a congested link", async () => {
+  const scales: Array<{ width: number; fps: number }> = [];
+  const capture = fakeCapture();
+  const withHooks = capture as unknown as {
+    setBitrate: (k: number) => void;
+    setScale: (w: number, f: number) => void;
+    encodeWidth: number;
+    encodeFps: number;
+  };
+  withHooks.encodeWidth = 1280;
+  withHooks.encodeFps = 59;
+  withHooks.setBitrate = () => {};
+  withHooks.setScale = (width, fps) => {
+    scales.push({ width, fps });
+    withHooks.encodeWidth = width;
+    withHooks.encodeFps = fps;
+  };
+
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 59,
+    maxQueuedFrameBytes: -1, // permanently "behind"
+    initialBitrateKbps: 700,
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+
+  // Pin a mid rung, then let the link stay congested for several adapt ticks.
+  const pinnedReport = nextMessage(ws, "qualityState");
+  ws.send(encodeMessage({ type: "setQuality", width: 1024 }));
+  const report = await pinnedReport;
+  assert.equal(report.type === "qualityState" && report.mode, "manual");
+
+  const afterPin = scales.length;
+  await new Promise((r) => setTimeout(r, 9000));
+
+  const movedSincePin = scales.slice(afterPin);
+  assert.deepEqual(
+    movedSincePin,
+    [],
+    `pinned quality must not be changed by the controller, got ${JSON.stringify(movedSincePin)}`,
+  );
+  assert.equal(withHooks.encodeWidth, 1024, "encoder must still be at the pinned width");
+
+  // Handing control back to Auto lets the controller move it again.
+  ws.send(encodeMessage({ type: "setQuality", width: null }));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(scales.length > afterPin, "expected auto to reassert control");
+
+  ws.close();
+  await server.close();
+});
