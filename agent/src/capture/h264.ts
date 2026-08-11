@@ -224,6 +224,20 @@ export class H264Capture implements ScreenCapture {
   /** Explicit capture size to request from the device, when one is wanted. */
   private captureWidth: number | null = null;
   private captureHeight: number | null = null;
+  /**
+   * Frame rate the DEVICE runs at, which stays fixed while the encode rate
+   * moves.
+   *
+   * The device's rate is fixed when it is opened, so honouring an fps change
+   * by reopening it meant every ladder step that crossed 60->30 or 30->15
+   * froze the picture for as long as the grabber took to restart and re-probe.
+   * That is the stutter you get in Auto and never get on a pinned resolution,
+   * because pinning stops the ladder moving. Capturing at one rate and
+   * encoding a subset of those frames removes the reopen entirely.
+   */
+  private deviceFps: number;
+  /** Fractional accumulator for frame skipping; see shouldEncode(). */
+  private frameCredit = 0;
 
   constructor(opts: H264CaptureOptions = {}) {
     this.width = opts.width ?? DEFAULTS.width;
@@ -232,6 +246,7 @@ export class H264Capture implements ScreenCapture {
     this.gopSeconds = opts.gopSeconds ?? DEFAULTS.gopSeconds;
     this.captureWidth = opts.captureWidth ?? null;
     this.captureHeight = opts.captureHeight ?? null;
+    this.deviceFps = this.fps;
   }
 
   start(handler: FrameHandler): void {
@@ -249,7 +264,40 @@ export class H264Capture implements ScreenCapture {
     const fps = Math.min(60, Math.max(1, Math.round(1000 / ms)));
     if (fps === this.fps) return;
     this.fps = fps;
-    if (this.running) this.restart();
+    if (!this.running) return;
+    if (this.needsDeviceRate(fps)) {
+      this.deviceFps = fps;
+      this.restart();
+      return;
+    }
+    this.encoderDirty = true;
+  }
+
+  /**
+   * Whether an encode rate warrants reopening the device.
+   *
+   * Only when the device cannot supply it, or supplies so much more than is
+   * wanted that decoding the surplus is pure waste — screenshot mode asks for
+   * roughly 0.5fps, and decoding 60 to throw away 59 is not a trade worth
+   * making. Ladder steps (60 -> 30 -> 15) stay well inside the window and so
+   * never touch the device.
+   */
+  private needsDeviceRate(fps: number): boolean {
+    return fps > this.deviceFps || fps * 4 < this.deviceFps;
+  }
+
+  /**
+   * Frame pacing: emit `this.fps` frames for every `this.deviceFps` captured.
+   *
+   * A credit accumulator rather than a modulo, so non-integer ratios (50fps
+   * device, 30fps encode) stay evenly spaced instead of clumping.
+   */
+  private shouldEncode(): boolean {
+    if (this.fps >= this.deviceFps) return true;
+    this.frameCredit += this.fps;
+    if (this.frameCredit < this.deviceFps) return false;
+    this.frameCredit -= this.deviceFps;
+    return true;
   }
 
   /**
@@ -298,14 +346,22 @@ export class H264Capture implements ScreenCapture {
     const f = Math.min(60, Math.max(1, Math.round(fps)));
     if (w === this.width && f === this.fps) return;
     const fpsChanged = f !== this.fps;
+    const widthChanged = w !== this.width;
     this.width = w;
     this.fps = f;
     if (!this.running) return;
-    // Scaling happens in the filter graph, not the device, so a width change
-    // needs only the scaler and encoder rebuilt. Frame rate is fixed when the
-    // device is opened, so that alone still costs a full restart.
-    if (fpsChanged) this.restart();
-    else this.geometryDirty = true;
+    // Scaling happens in the filter graph and the encode rate is now a subset
+    // of the device's, so neither needs the device reopened. Only a rate the
+    // device genuinely cannot serve does -- see needsDeviceRate().
+    if (this.needsDeviceRate(f)) {
+      this.deviceFps = f;
+      this.restart();
+      return;
+    }
+    if (widthChanged) this.geometryDirty = true;
+    // A new encode rate changes the encoder's timebase and GOP length, so the
+    // encoder is rebuilt -- cheap, and nothing like reopening the grabber.
+    if (fpsChanged) this.encoderDirty = true;
   }
 
   /**
@@ -436,7 +492,7 @@ export class H264Capture implements ScreenCapture {
     let ctx: CodecContext | null = null;
     try {
       demuxer = await DeviceAPI.openScreen({
-        frameRate: this.fps,
+        frameRate: this.deviceFps,
         // Ask for the size we actually want to encode.
         //
         // Without this the device hands back the display's LOGICAL size (1728
@@ -485,6 +541,14 @@ export class H264Capture implements ScreenCapture {
       for await (const frame of decoder.frames(demuxer.packets(stream.index))) {
         if (generation !== this.generation || !this.running) break;
         if (!frame) continue;
+
+        // Drop surplus frames before doing any work on them: the filter and
+        // encoder are the expensive part, and a frame that will not be sent is
+        // not worth scaling.
+        if (!this.shouldEncode()) {
+          frame.free?.();
+          continue;
+        }
 
         // Apply pending quality changes WITHOUT reopening the device.
         if (this.geometryDirty || this.encoderDirty) {

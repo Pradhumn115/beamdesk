@@ -363,8 +363,10 @@ test("steps resolution and fps down when bitrate hits the floor", async () => {
   ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
   await info;
 
-  // Long enough for bitrate to reach the floor and the ladder to move.
-  await new Promise((r) => setTimeout(r, 9000));
+  // Long enough for bitrate to reach the floor AND for the descent to be
+  // confirmed: the ladder deliberately waits LADDER_DOWN_CONFIRM checks at the
+  // floor before spending a rung, so a step is ~5 ticks away, not ~2.
+  await new Promise((r) => setTimeout(r, 15000));
   ws.close();
   await server.close();
 
@@ -477,10 +479,16 @@ test("restores the encoder to full quality when the session ends", async () => {
   ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
   await info;
 
-  await new Promise((r) => setTimeout(r, 9000));
+  // As above: bitrate must bottom out and the descent be confirmed.
+  await new Promise((r) => setTimeout(r, 15000));
   const duringSession = scales.length;
   assert.ok(duringSession > 0, "expected the congested link to step quality down");
-  assert.ok(withHooks.encodeWidth < 1280, "expected the encoder to be narrower mid-session");
+  // Rung 1 is the SAME width at 30fps -- the ladder gives up frame rate before
+  // pixels -- so "stepped down" means either dimension moved, not width alone.
+  assert.ok(
+    withHooks.encodeWidth < 1280 || withHooks.encodeFps < 59,
+    `expected the encoder to have stepped down mid-session, got ${withHooks.encodeWidth}x@${withHooks.encodeFps}`,
+  );
 
   ws.close();
   await server.close();
@@ -620,5 +628,82 @@ test("drops frames when the WebTransport backlog is behind, not just the WebSock
     sent,
     [],
     `a saturated QUIC session must drop rather than queue, got ${sent.length} frames sent`,
+  );
+});
+
+/**
+ * Auto -> pinned -> Auto must not collapse the picture.
+ *
+ * While pinned the ladder is frozen but the BITRATE controller keeps running,
+ * so a congested link winds bitrate down to the floor. Returning to Auto then
+ * met "congested and at the floor" on the very first tick, and the old code
+ * both snapped back to the pinned (full) width and gave up a rung every tick
+ * afterwards — walking to the 320px floor every single time.
+ */
+test("returning to auto after a pin does not walk the ladder to the bottom", async () => {
+  const scales: Array<{ width: number; fps: number }> = [];
+  const capture = fakeCapture();
+  const withHooks = capture as unknown as {
+    setBitrate: (k: number) => void;
+    setScale: (w: number, f: number) => void;
+    encodeWidth: number;
+    encodeFps: number;
+  };
+  withHooks.encodeWidth = 1920;
+  withHooks.encodeFps = 60;
+  withHooks.setBitrate = () => {};
+  withHooks.setScale = (width, fps) => {
+    scales.push({ width, fps });
+    withHooks.encodeWidth = width;
+    withHooks.encodeFps = fps;
+  };
+
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 60,
+    maxQueuedFrameBytes: -1, // permanently congested, as on the link that showed this
+    initialBitrateKbps: 500, // bottoms out almost immediately
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+
+  // Pin the top rung on a link that cannot carry it, exactly as a viewer would.
+  ws.send(encodeMessage({ type: "setQuality", width: 1920 }));
+  await new Promise((r) => setTimeout(r, 5000));
+
+  // Hand control back; this is the moment the collapse used to start.
+  const afterUnpin = scales.length;
+  ws.send(encodeMessage({ type: "setQuality", width: null }));
+  await new Promise((r) => setTimeout(r, 9000));
+  // Snapshot BEFORE teardown: closing the session restores baseline quality,
+  // which is another setScale and not a ladder move.
+  const movesAfterUnpin = scales.slice(afterUnpin + 1); // skip the resume itself
+  ws.close();
+  await server.close();
+  const widths = movesAfterUnpin.map((m) => m.width);
+  // 9s is ~4 ticks. Unconfirmed descent gave up a rung per tick; confirmation
+  // caps it at 1, and nothing may reach the 320px floor this quickly.
+  assert.ok(
+    movesAfterUnpin.length <= 2,
+    `expected at most 2 rungs in ~4 ticks, got ${widths.length}: ${JSON.stringify(widths)}`,
+  );
+  assert.ok(
+    !widths.includes(320),
+    `must not collapse to the floor on un-pin, got ${JSON.stringify(widths)}`,
   );
 });

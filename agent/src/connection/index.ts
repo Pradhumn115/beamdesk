@@ -232,6 +232,22 @@ export function buildQualityLadder(
 const LADDER_RECOVERY_CHECKS = 5;
 
 /**
+ * Consecutive congested-at-the-floor checks required before giving up a rung.
+ *
+ * Without this the descent is unstoppable: bitrate takes ~27 ticks to climb
+ * from the floor to a ceiling (x1.15 each), while the ladder was dropping a
+ * rung EVERY tick that bitrate sat at the floor. Any event that parks bitrate
+ * low -- a burst of congestion, or simply un-pinning a resolution after the
+ * controller had wound bitrate down -- therefore walked the picture from full
+ * size to the 320px floor in about twenty seconds, and recovery then needed
+ * five clean checks per rung to undo it.
+ *
+ * Requiring confirmation gives bitrate room to prove whether the CURRENT rung
+ * is actually unsustainable before spending another one.
+ */
+const LADDER_DOWN_CONFIRM = 3;
+
+/**
  * Bitrate ceiling for a given encode width, scaled by pixel AREA relative to
  * the 1920px baseline BITRATE_MAX_KBPS_AT_1920 was tuned against — area, not
  * width, is what "bits per pixel" means, and for a fixed aspect ratio area
@@ -259,6 +275,8 @@ export function bitrateCeilingForWidth(width: number | undefined): number {
 export interface LadderState {
   rung: number;
   healthyChecks: number;
+  /** Consecutive congested-at-the-floor checks; see LADDER_DOWN_CONFIRM. */
+  floorChecks?: number;
 }
 
 /**
@@ -276,10 +294,14 @@ export function decideLadderMove(
   const { congested, bitrateKbps, ceilingKbps, rungCount } = input;
 
   if (congested && bitrateKbps <= BITRATE_MIN_KBPS) {
-    const canDescend = state.rung < rungCount - 1;
+    const floorChecks = (state.floorChecks ?? 0) + 1;
+    const canDescend = state.rung < rungCount - 1 && floorChecks >= LADDER_DOWN_CONFIRM;
     return {
       rung: canDescend ? state.rung + 1 : state.rung,
       healthyChecks: 0,
+      // Reset after a move: the next rung earns its own confirmation rather
+      // than inheriting evidence gathered against a larger picture.
+      floorChecks: canDescend ? 0 : floorChecks,
       moved: canDescend ? "down" : null,
     };
   }
@@ -287,12 +309,12 @@ export function decideLadderMove(
   if (!congested && bitrateKbps >= ceilingKbps) {
     const checks = state.healthyChecks + 1;
     if (checks >= LADDER_RECOVERY_CHECKS && state.rung > 0) {
-      return { rung: state.rung - 1, healthyChecks: 0, moved: "up" };
+      return { rung: state.rung - 1, healthyChecks: 0, floorChecks: 0, moved: "up" };
     }
-    return { rung: state.rung, healthyChecks: checks, moved: null };
+    return { rung: state.rung, healthyChecks: checks, floorChecks: 0, moved: null };
   }
 
-  return { rung: state.rung, healthyChecks: 0, moved: null };
+  return { rung: state.rung, healthyChecks: 0, floorChecks: 0, moved: null };
 }
 
 /**
@@ -357,6 +379,10 @@ export class ConnectionServer {
   private ladderRung = 0;
   /** Consecutive healthy checks, for cautious recovery up the ladder. */
   private healthyChecks = 0;
+  /** Consecutive congested-at-the-floor checks; see LADDER_DOWN_CONFIRM. */
+  private floorChecks = 0;
+  /** Rung the ladder was on before a manual pin, so un-pinning can return to it. */
+  private rungBeforePin: number | null = null;
   /** Frames dropped since the last adaptation decision. */
   private dropsSinceAdapt = 0;
 
@@ -578,7 +604,11 @@ export class ConnectionServer {
       // move resolution underneath them. Bitrate still adapts below.
       if (this.deps.capture.setScale && this.qualityMode === "auto") {
         const decision = decideLadderMove(
-          { rung: this.ladderRung, healthyChecks: this.healthyChecks },
+          {
+            rung: this.ladderRung,
+            healthyChecks: this.healthyChecks,
+            floorChecks: this.floorChecks,
+          },
           {
             congested,
             bitrateKbps: this.bitrateKbps,
@@ -588,6 +618,7 @@ export class ConnectionServer {
         );
         this.ladderRung = decision.rung;
         this.healthyChecks = decision.healthyChecks;
+        this.floorChecks = decision.floorChecks ?? 0;
         if (decision.moved === "down") this.applyRung("still congested at the bitrate floor");
         if (decision.moved === "up") this.applyRung("link sustained at full bitrate");
       }
@@ -648,10 +679,18 @@ export class ConnectionServer {
       this.qualityMode = "auto";
       this.pinned = null;
       this.setBuffering(false);
-      // Resume from the nearest rung rather than snapping to full quality: the
-      // link has not been tested at anything wider, so jumping straight to
-      // rung 0 would re-create the congestion the ladder exists to avoid.
-      this.ladderRung = this.nearestRung(this.deps.capture.encodeWidth ?? 0);
+      // Resume the rung the ladder was on BEFORE the pin, not the rung matching
+      // the pinned width. Pinning 1920 on a weak link left encodeWidth at 1920,
+      // so the old nearestRung() lookup returned rung 0 and un-pinning snapped
+      // straight back to full quality -- with bitrate still parked at the floor
+      // from the pinned period, which immediately walked the ladder to the
+      // bottom. Falls back to the nearest rung when nothing was recorded.
+      this.ladderRung =
+        this.rungBeforePin ?? this.nearestRung(this.deps.capture.encodeWidth ?? 0);
+      this.rungBeforePin = null;
+      // The pinned period tells us nothing about this rung's sustainability.
+      this.healthyChecks = 0;
+      this.floorChecks = 0;
       this.applyRung("viewer returned quality to auto");
       return;
     }
@@ -660,9 +699,11 @@ export class ConnectionServer {
     // Snap to a real rung so the picker can never ask for a geometry the
     // encoder would silently clamp anyway (see H264Capture.setScale).
     const choice = ladder[this.nearestRung(width)] ?? ladder[0];
+    if (this.qualityMode === "auto") this.rungBeforePin = this.ladderRung;
     this.qualityMode = "manual";
     this.pinned = { width: choice.width, fps: fps ?? choice.fps };
     this.healthyChecks = 0;
+    this.floorChecks = 0;
     this.deps.capture.setScale?.(this.pinned.width, this.pinned.fps);
     process.stderr.write(
       `[adapt] quality pinned -> ${this.pinned.width}px @ ${this.pinned.fps}fps (viewer choice)\n`,
@@ -718,6 +759,8 @@ export class ConnectionServer {
     this.dropsSinceAdapt = 0;
     this.ladderRung = 0;
     this.healthyChecks = 0;
+    this.floorChecks = 0;
+    this.rungBeforePin = null;
     // Rung 0 must mean full quality for the NEXT session too, so the encoder
     // has to actually be there — and the ladder is rebuilt from the baseline
     // rather than reused, in case the display changed between sessions.

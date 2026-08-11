@@ -38,18 +38,24 @@ test("the ceiling never drops below the bitrate floor", () => {
 
 const RUNGS = 6;
 
-test("steps down immediately when congested at the bitrate floor", () => {
-  const next = decideLadderMove(
-    { rung: 0, healthyChecks: 0 },
-    { congested: true, bitrateKbps: 400, ceilingKbps: 20000, rungCount: RUNGS },
-  );
-  assert.equal(next.rung, 1);
-  assert.equal(next.moved, "down");
+test("steps down once congestion at the floor is confirmed", () => {
+  const congested = {
+    congested: true,
+    bitrateKbps: 400,
+    ceilingKbps: 20000,
+    rungCount: RUNGS,
+  };
+  // Confirmation, not immediacy: a lone tick at the floor is often just
+  // bitrate still ramping. See LADDER_DOWN_CONFIRM.
+  let state: LadderState & { moved?: unknown } = { rung: 0, healthyChecks: 0, floorChecks: 2 };
+  state = decideLadderMove(state, congested);
+  assert.equal(state.rung, 1);
+  assert.equal(state.moved, "down");
 });
 
 test("does not descend past the last rung", () => {
   const next = decideLadderMove(
-    { rung: RUNGS - 1, healthyChecks: 0 },
+    { rung: RUNGS - 1, healthyChecks: 0, floorChecks: 2 },
     { congested: true, bitrateKbps: 400, ceilingKbps: 20000, rungCount: RUNGS },
   );
   assert.equal(next.rung, RUNGS - 1);
@@ -135,4 +141,72 @@ test("a ladder built from an already-degraded width collapses to a single size",
     "every rung is the floor, so there is no way back up",
   );
   assert.equal(corrupted[0].fps, 59, "and rung 0 reports the full refresh rate");
+});
+
+/**
+ * The descent must not outrun the bitrate controller.
+ *
+ * Bitrate climbs x1.15 per tick, so ~27 ticks from the floor to a ceiling —
+ * while the ladder used to give up a rung on EVERY tick that bitrate sat at
+ * the floor. Anything that parked bitrate low (a congestion burst, or
+ * un-pinning a resolution after the controller had wound bitrate down) walked
+ * the picture to the 320px floor in ~20s, and it then needed five clean checks
+ * per rung to climb back.
+ */
+test("a single congested-at-the-floor tick does not cost a rung", () => {
+  const next = decideLadderMove(
+    { rung: 0, healthyChecks: 0, floorChecks: 0 },
+    { congested: true, bitrateKbps: 400, ceilingKbps: 20000, rungCount: RUNGS },
+  );
+  assert.equal(next.rung, 0, "must wait for confirmation");
+  assert.equal(next.moved, null);
+  assert.equal(next.floorChecks, 1);
+});
+
+test("descends only after repeated confirmation, then re-arms", () => {
+  const congested = {
+    congested: true,
+    bitrateKbps: 400,
+    ceilingKbps: 20000,
+    rungCount: RUNGS,
+  };
+  let state: LadderState & { moved?: unknown } = { rung: 0, healthyChecks: 0, floorChecks: 0 };
+  state = decideLadderMove(state, congested);
+  state = decideLadderMove(state, congested);
+  assert.equal(state.rung, 0, "still holding after two");
+  state = decideLadderMove(state, congested);
+  assert.equal(state.rung, 1, "third confirmation spends a rung");
+  assert.equal(state.floorChecks, 0, "counter re-arms for the next rung");
+
+  // The next rung must earn its own confirmation rather than falling straight
+  // through — this is what turned one bad moment into a full collapse.
+  state = decideLadderMove(state, congested);
+  assert.equal(state.rung, 1);
+});
+
+test("recovering bitrate clears the descent evidence", () => {
+  let state: LadderState = { rung: 2, healthyChecks: 0, floorChecks: 2 };
+  // One tick where bitrate is off the floor: not proof of health, but proof
+  // that the floor evidence is stale.
+  state = decideLadderMove(state, {
+    congested: true,
+    bitrateKbps: 5000,
+    ceilingKbps: 20000,
+    rungCount: RUNGS,
+  });
+  assert.equal(state.floorChecks, 0);
+  assert.equal(state.rung, 2);
+});
+
+test("ten congested ticks cost at most three rungs, not ten", () => {
+  let state: LadderState = { rung: 0, healthyChecks: 0, floorChecks: 0 };
+  for (let i = 0; i < 10; i++) {
+    state = decideLadderMove(state, {
+      congested: true,
+      bitrateKbps: 400,
+      ceilingKbps: 20000,
+      rungCount: RUNGS,
+    });
+  }
+  assert.equal(state.rung, 3, `expected 10 ticks / 3 confirmations = 3 rungs, got ${state.rung}`);
 });
