@@ -4,7 +4,7 @@ import { formatConnectionLines, localAddresses } from "./net.js";
 import { isElevated } from "./inputlock/elevation.js";
 import { CaptureLoop, createScreenshotCapture, type ScreenCapture } from "./capture/index.js";
 import { FfmpegCapture, ffmpegAvailable, screenCaptureInputArgs } from "./capture/ffmpeg.js";
-import { detectRefreshHz } from "./display.js";
+import { detectRefreshHz, detectScreenPixels } from "./display.js";
 import { InputController } from "./input/index.js";
 import { createNutBackend } from "./input/nutBackend.js";
 import { createNutTypingBackend } from "./autotyper/nutTyping.js";
@@ -69,10 +69,17 @@ async function main(): Promise<void> {
   // ceiling instead of spreading a fixed budget over more pixels than it was
   // tuned for. Falls back to 1920 if screen size can't be read. BCSA_MAX_WIDTH
   // still overrides either way, e.g. to deliberately cap a weak link.
-  const nativeWidth = await input
+  // The PHYSICAL panel size, when it can be detected, in preference to the
+  // logical one. screenSize() reports points, which on a Retina display is
+  // half the real resolution — and since the capture device reports the same
+  // logical size and the encode width is clamped to it, the stream could never
+  // carry the display's actual detail. Falls back to points, then to 1920.
+  const pixels = detectScreenPixels();
+  const logicalWidth = await input
     .screenSize()
     .then((s) => s.width)
     .catch(() => 1920);
+  const nativeWidth = pixels?.width ?? logicalWidth;
   const maxWidth = process.env.BCSA_MAX_WIDTH ? Number(process.env.BCSA_MAX_WIDTH) : nativeWidth;
   const refreshHz = detectRefreshHz();
   let capture: ScreenCapture;
@@ -101,10 +108,10 @@ async function main(): Promise<void> {
     // caps the encode width far below the panel's real resolution.
     const captureWidth = process.env.BCSA_CAPTURE_WIDTH
       ? Number(process.env.BCSA_CAPTURE_WIDTH)
-      : undefined;
+      : pixels?.width;
     const captureHeight = process.env.BCSA_CAPTURE_HEIGHT
       ? Number(process.env.BCSA_CAPTURE_HEIGHT)
-      : undefined;
+      : pixels?.height;
     capture = new H264Capture({
       width: maxWidth,
       fps: Math.min(60, refreshHz),
