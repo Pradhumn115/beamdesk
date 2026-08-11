@@ -115,6 +115,17 @@ function secretsMatch(provided: string, expected: string): boolean {
  * saturated link from queueing rather than dropping, on either codec.
  */
 const MAX_QUEUED_FRAME_BYTES = 512 * 1024;
+/**
+ * Queue ceiling once the viewer has PINNED a resolution.
+ *
+ * Auto mode stays real-time by discarding frames — an unbounded queue is what
+ * made Classic drift permanently behind (see MAX_QUEUED_FRAME_BYTES). Pinning
+ * a rung is an explicit request for that size regardless of the link, so
+ * frames are allowed to queue instead, the way a video player buffers. Still
+ * bounded: past this the link is not merely slow, and dropping beats consuming
+ * memory without limit.
+ */
+const BUFFERED_MAX_QUEUED_FRAME_BYTES = 8 * 1024 * 1024;
 
 /** Minimum gap between "dropping frames" log lines. */
 const DROP_LOG_THROTTLE_MS = 5000;
@@ -190,7 +201,7 @@ const LADDER_MIN_WIDTH = 320;
  * proportional descent (see LADDER_WIDTH_STEP) instead of a few large,
  * perceptible jumps. Widths are kept even (yuv420p needs it).
  */
-function buildQualityLadder(
+export function buildQualityLadder(
   startWidth: number,
   startFps: number,
 ): ReadonlyArray<{ width: number; fps: number }> {
@@ -219,6 +230,70 @@ function buildQualityLadder(
  * can hold it.
  */
 const LADDER_RECOVERY_CHECKS = 5;
+
+/**
+ * Bitrate ceiling for a given encode width, scaled by pixel AREA relative to
+ * the 1920px baseline BITRATE_MAX_KBPS_AT_1920 was tuned against — area, not
+ * width, is what "bits per pixel" means, and for a fixed aspect ratio area
+ * scales with width squared.
+ *
+ * The ceiling MUST track the current rung rather than being pinned to the
+ * 1920 baseline. The controller only climbs back up the quality ladder once
+ * bitrate has reached this ceiling, so a ceiling that stays at 20000kbps no
+ * matter how small the picture got asks a link to sustain 20 Mbit/s before it
+ * may return to full resolution — bits the small encode could not spend even
+ * if the link delivered them. A link that just congested never gets there, so
+ * every step down was permanent for the rest of the session.
+ *
+ * Falls back to the baseline when the active capture engine exposes no
+ * encodeWidth (the screenshot-desktop path, which has no bitrate control to
+ * begin with).
+ */
+export function bitrateCeilingForWidth(width: number | undefined): number {
+  if (!width) return BITRATE_MAX_KBPS_AT_1920;
+  const scaled = Math.round(BITRATE_MAX_KBPS_AT_1920 * (width / 1920) ** 2);
+  return Math.min(BITRATE_MAX_KBPS_CAP, Math.max(BITRATE_MIN_KBPS, scaled));
+}
+
+/** Ladder state the controller carries between adaptation ticks. */
+export interface LadderState {
+  rung: number;
+  healthyChecks: number;
+}
+
+/**
+ * Decides whether to move a rung this tick. Pure so the escalation and
+ * recovery rules can be tested directly.
+ *
+ * Down is immediate once bitrate has bottomed out; up requires
+ * LADDER_RECOVERY_CHECKS consecutive ticks at the (rung-relative) ceiling,
+ * because reopening the encoder forces a keyframe and must not oscillate.
+ */
+export function decideLadderMove(
+  state: LadderState,
+  input: { congested: boolean; bitrateKbps: number; ceilingKbps: number; rungCount: number },
+): LadderState & { moved: "down" | "up" | null } {
+  const { congested, bitrateKbps, ceilingKbps, rungCount } = input;
+
+  if (congested && bitrateKbps <= BITRATE_MIN_KBPS) {
+    const canDescend = state.rung < rungCount - 1;
+    return {
+      rung: canDescend ? state.rung + 1 : state.rung,
+      healthyChecks: 0,
+      moved: canDescend ? "down" : null,
+    };
+  }
+
+  if (!congested && bitrateKbps >= ceilingKbps) {
+    const checks = state.healthyChecks + 1;
+    if (checks >= LADDER_RECOVERY_CHECKS && state.rung > 0) {
+      return { rung: state.rung - 1, healthyChecks: 0, moved: "up" };
+    }
+    return { rung: state.rung, healthyChecks: checks, moved: null };
+  }
+
+  return { rung: state.rung, healthyChecks: 0, moved: null };
+}
 
 /**
  * Queue depth that counts as "the link is behind".
@@ -260,6 +335,24 @@ export class ConnectionServer {
   private peakBacklog = 0;
   /** Built once, from the width/fps the session actually started at — see buildQualityLadder. */
   private ladder: ReadonlyArray<{ width: number; fps: number }> | null = null;
+  /**
+   * The encoder's untouched starting geometry, captured before any adaptation.
+   *
+   * The ladder MUST be derived from this rather than from the live
+   * encodeWidth. Reading the live width meant that if the cache was ever built
+   * while the encoder was already scaled down, the reduced width became rung 0
+   * — "best quality" — and the session could never climb above it again. The
+   * signature was a bottom-rung width reported at the full refresh rate
+   * (e.g. 320px @ 59fps), a pairing the real ladder never produces because it
+   * drops fps long before reaching its narrowest rung.
+   */
+  private baselineWidth: number | null = null;
+  /** "manual" once the viewer pins a rung; the ladder stops moving. */
+  private qualityMode: "auto" | "manual" = "auto";
+  /** The pinned geometry, when qualityMode is "manual". */
+  private pinned: { width: number; fps: number } | null = null;
+  /** Frames are queueing rather than being dropped (manual mode only). */
+  private buffering = false;
   /** Index into this.ladder; 0 is best. */
   private ladderRung = 0;
   /** Consecutive healthy checks, for cautious recovery up the ladder. */
@@ -386,31 +479,54 @@ export class ConnectionServer {
     if (ws.readyState === ws.OPEN) ws.send(encodeMessage(msg));
   }
 
-  /** Lazily built from the width/fps the session actually started at (see buildQualityLadder). */
+  /**
+   * Lazily built from the encoder's ORIGINAL geometry (see buildQualityLadder
+   * and baselineWidth) — never from the live width, which may already be
+   * degraded.
+   */
   private getLadder(): ReadonlyArray<{ width: number; fps: number }> {
     if (!this.ladder) {
-      const startWidth = this.deps.capture.encodeWidth ?? 1920;
-      this.ladder = buildQualityLadder(startWidth, this.deps.refreshHz);
+      this.rememberBaseline();
+      this.ladder = buildQualityLadder(this.baselineWidth ?? 1920, this.deps.refreshHz);
     }
     return this.ladder;
+  }
+
+  /** Latches the encoder's pre-adaptation geometry the first time it is seen. */
+  private rememberBaseline(): void {
+    if (this.baselineWidth !== null) return;
+    this.baselineWidth = this.deps.capture.encodeWidth ?? null;
+  }
+
+  /**
+   * Returns the encoder to full quality and forgets the session's ladder.
+   *
+   * Without this a congested session left the encoder scaled down for the
+   * whole life of the agent process: the next client reset ladderRung to 0 —
+   * "we are at the top" — while the picture was still at the narrow width the
+   * previous session ended on, so nothing ever stepped it back up.
+   */
+  private restoreBaselineQuality(): void {
+    if (this.baselineWidth === null || !this.deps.capture.setScale) return;
+    // Restore rung 0 itself rather than a remembered fps. The live encodeFps
+    // is mode-dependent -- a screenshot-mode session runs at well under 1fps,
+    // and latching THAT as the baseline stranded the next session at 1fps.
+    // Rung 0 is by definition what "full quality" means for this session.
+    const top = this.getLadder()[0];
+    this.deps.capture.setScale(top.width, top.fps);
+    process.stderr.write(
+      `[adapt] quality reset -> ${top.width}px @ ${top.fps}fps (session ended)\n`,
+    );
   }
 
   /**
    * Bitrate ceiling for the resolution this session actually started at.
    *
-   * Scales with pixel AREA relative to the 1920px baseline
-   * BITRATE_MAX_KBPS_AT_1920 was tuned against — area, not width, is what
-   * "bits per pixel" means, and for a fixed aspect ratio area scales with
-   * width squared. Never scaled below the baseline, so a smaller-than-1920
-   * display keeps exactly the ceiling it already had. Falls back to the
-   * baseline when the active capture engine exposes no encodeWidth (the
-   * screenshot-desktop path, which has no bitrate control to begin with).
+   * Delegates to the pure bitrateCeilingForWidth() so the rule can be tested
+   * without standing up a server.
    */
   private bitrateCeilingKbps(): number {
-    const width = this.deps.capture.encodeWidth;
-    if (!width) return BITRATE_MAX_KBPS_AT_1920;
-    const scaled = Math.round(BITRATE_MAX_KBPS_AT_1920 * (width / 1920) ** 2);
-    return Math.min(BITRATE_MAX_KBPS_CAP, Math.max(BITRATE_MAX_KBPS_AT_1920, scaled));
+    return bitrateCeilingForWidth(this.deps.capture.encodeWidth);
   }
 
   /**
@@ -458,26 +574,22 @@ export class ConnectionServer {
       // Bitrate is the cheap, invisible lever; changing frame size reopens the
       // encoder and forces a keyframe, so it is reserved for links that cannot
       // be rescued by spending fewer bits on the same picture.
-      if (this.deps.capture.setScale) {
-        if (congested && this.bitrateKbps <= BITRATE_MIN_KBPS) {
-          this.healthyChecks = 0;
-          if (this.ladderRung < this.getLadder().length - 1) {
-            this.ladderRung++;
-            this.applyRung("still congested at the bitrate floor");
-          }
-        } else if (!congested && this.bitrateKbps >= ceiling) {
-          // Only climb back when bitrate is already maxed AND the link has been
-          // quiet for a while: stepping up prematurely re-creates the
-          // congestion that forced the step down.
-          this.healthyChecks++;
-          if (this.healthyChecks >= LADDER_RECOVERY_CHECKS && this.ladderRung > 0) {
-            this.healthyChecks = 0;
-            this.ladderRung--;
-            this.applyRung("link sustained at full bitrate");
-          }
-        } else {
-          this.healthyChecks = 0;
-        }
+      // A pinned rung is the viewer's explicit choice; the controller must not
+      // move resolution underneath them. Bitrate still adapts below.
+      if (this.deps.capture.setScale && this.qualityMode === "auto") {
+        const decision = decideLadderMove(
+          { rung: this.ladderRung, healthyChecks: this.healthyChecks },
+          {
+            congested,
+            bitrateKbps: this.bitrateKbps,
+            ceilingKbps: ceiling,
+            rungCount: this.getLadder().length,
+          },
+        );
+        this.ladderRung = decision.rung;
+        this.healthyChecks = decision.healthyChecks;
+        if (decision.moved === "down") this.applyRung("still congested at the bitrate floor");
+        if (decision.moved === "up") this.applyRung("link sustained at full bitrate");
       }
 
       const previous = this.bitrateKbps;
@@ -500,6 +612,9 @@ export class ConnectionServer {
 
       this.bitrateKbps = next;
       this.deps.capture.setBitrate?.(next);
+      // The strip shows this number; without a report it freezes at whatever
+      // it was when the last rung change happened.
+      this.sendQualityState();
       process.stderr.write(
         `[adapt] ${previous} -> ${next} kbps ` +
           `(${congested ? `backlog ${(backlog / 1024).toFixed(0)}KB, ${drops} dropped` : "link healthy"})\n`,
@@ -515,6 +630,83 @@ export class ConnectionServer {
     process.stderr.write(
       `[adapt] quality -> ${rung.width}px @ ${rung.fps}fps (${reason})\n`,
     );
+    this.sendQualityState();
+  }
+
+  /**
+   * Tells the viewer what it is actually being shown.
+   *
+   * A stepped-down picture is otherwise silent: the image just gets soft, with
+   * nothing to distinguish adaptation from a stalled encoder or a bad link.
+   */
+  /**
+   * Applies the viewer's resolution choice. `width === null` returns control to
+   * the adaptive controller from wherever it currently is.
+   */
+  private applyQualityChoice(width: number | null, fps?: number): void {
+    if (width === null) {
+      this.qualityMode = "auto";
+      this.pinned = null;
+      this.setBuffering(false);
+      // Resume from the nearest rung rather than snapping to full quality: the
+      // link has not been tested at anything wider, so jumping straight to
+      // rung 0 would re-create the congestion the ladder exists to avoid.
+      this.ladderRung = this.nearestRung(this.deps.capture.encodeWidth ?? 0);
+      this.applyRung("viewer returned quality to auto");
+      return;
+    }
+
+    const ladder = this.getLadder();
+    // Snap to a real rung so the picker can never ask for a geometry the
+    // encoder would silently clamp anyway (see H264Capture.setScale).
+    const choice = ladder[this.nearestRung(width)] ?? ladder[0];
+    this.qualityMode = "manual";
+    this.pinned = { width: choice.width, fps: fps ?? choice.fps };
+    this.healthyChecks = 0;
+    this.deps.capture.setScale?.(this.pinned.width, this.pinned.fps);
+    process.stderr.write(
+      `[adapt] quality pinned -> ${this.pinned.width}px @ ${this.pinned.fps}fps (viewer choice)\n`,
+    );
+    this.sendQualityState();
+  }
+
+  /** Index of the ladder rung closest to `width`. */
+  private nearestRung(width: number): number {
+    const ladder = this.getLadder();
+    let best = 0;
+    for (let i = 1; i < ladder.length; i++) {
+      if (Math.abs(ladder[i].width - width) < Math.abs(ladder[best].width - width)) best = i;
+    }
+    return best;
+  }
+
+  /** Reports a buffering transition once, rather than on every frame. */
+  private setBuffering(active: boolean): void {
+    if (this.buffering === active) return;
+    this.buffering = active;
+    this.sendQualityState();
+  }
+
+  private sendQualityState(ws: WebSocket | null = this.controller): void {
+    if (!ws) return;
+    const ladder = this.getLadder();
+    const rung =
+      this.pinned ??
+      ladder[this.ladderRung] ?? {
+        width: this.deps.capture.encodeWidth ?? 0,
+        fps: this.deps.capture.encodeFps ?? 0,
+      };
+    if (!rung.width || !rung.fps) return; // engine exposes no scaling; nothing to report
+    this.send(ws, {
+      type: "qualityState",
+      width: rung.width,
+      fps: rung.fps,
+      bitrateKbps: this.bitrateKbps,
+      degraded: this.qualityMode === "auto" && this.ladderRung > 0,
+      mode: this.qualityMode,
+      buffering: this.buffering,
+      options: ladder.map((r) => ({ width: r.width, fps: r.fps })),
+    });
   }
 
   private stopAdapting(): void {
@@ -526,6 +718,15 @@ export class ConnectionServer {
     this.dropsSinceAdapt = 0;
     this.ladderRung = 0;
     this.healthyChecks = 0;
+    // Rung 0 must mean full quality for the NEXT session too, so the encoder
+    // has to actually be there — and the ladder is rebuilt from the baseline
+    // rather than reused, in case the display changed between sessions.
+    this.restoreBaselineQuality();
+    this.ladder = null;
+    // The next viewer has made no choice yet, so they get Auto.
+    this.qualityMode = "auto";
+    this.pinned = null;
+    this.buffering = false;
   }
 
   /**
@@ -650,6 +851,13 @@ export class ConnectionServer {
 
     this.deps.capture.setInterval(SCREENSHOT_INTERVAL);
     this.startCapture();
+
+    // Latch the untouched geometry before anything can scale it.
+    this.rememberBaseline();
+
+    // Baseline quality, so the indicator reads the true starting resolution
+    // rather than staying blank until the first adaptation.
+    this.sendQualityState(ws);
   }
 
   /**
@@ -670,7 +878,18 @@ export class ConnectionServer {
       const wtSend = this.deps.webtransport;
       const queued = wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount;
       if (queued > this.peakBacklog) this.peakBacklog = queued;
-      if (ws.bufferedAmount > (this.deps.maxQueuedFrameBytes ?? MAX_QUEUED_FRAME_BYTES)) {
+      const dropAbove =
+        this.deps.maxQueuedFrameBytes ??
+        (this.qualityMode === "manual"
+          ? BUFFERED_MAX_QUEUED_FRAME_BYTES
+          : MAX_QUEUED_FRAME_BYTES);
+      // Buffering is only meaningful against the real-time threshold: past it
+      // an auto session would already be dropping, so this is the point where
+      // a pinned session is knowingly trading latency for the chosen size.
+      this.setBuffering(
+        this.qualityMode === "manual" && ws.bufferedAmount > MAX_QUEUED_FRAME_BYTES,
+      );
+      if (ws.bufferedAmount > dropAbove) {
         this.droppedFrames++;
         this.dropsSinceAdapt++;
         this.logDroppedFrames(ws.bufferedAmount);
@@ -715,6 +934,9 @@ export class ConnectionServer {
           // Capture may not be running yet on the first setMode; start it.
           this.startCapture();
           this.deps.capture.setInterval(msg.intervalMs);
+          break;
+        case "setQuality":
+          this.applyQualityChoice(msg.width, msg.fps);
           break;
         case "mouse":
           this.deps.inputLock.noteClientActivity();

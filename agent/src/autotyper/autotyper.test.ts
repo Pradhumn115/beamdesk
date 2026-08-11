@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runAutotype, type TypingBackend } from "./index.js";
+import { looksIndented, runAutotype, type TypingBackend } from "./index.js";
 
 function recorder() {
   const events: string[] = [];
@@ -10,6 +10,12 @@ function recorder() {
     },
     async backspace() {
       events.push("<BS>");
+    },
+    async pressEnter() {
+      events.push("<CR>");
+    },
+    async selectToLineStart() {
+      events.push("<SEL>");
     },
   };
   return { events, backend };
@@ -92,6 +98,38 @@ test("stops typing when the signal is aborted mid-run", async () => {
   assert.equal(events.join(""), "abc"); // stopped after the 3rd char
 });
 
+test("presses Enter for a newline instead of typing it as a character", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "one.\ntwo",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  // The line break must be a real Return press, otherwise "two" continues on
+  // the same line right after the period: "one.two".
+  assert.deepEqual(events, ["o", "n", "e", ".", "<CR>", "t", "w", "o"]);
+});
+
+test("treats CRLF as a single Enter press", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "a\r\nb",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  assert.deepEqual(events, ["a", "<CR>", "b"]);
+});
+
+test("never injects a typo in place of a line break", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "\n",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 1 },
+    { backend, sleep: noSleep, rng: () => 0 },
+  );
+  assert.deepEqual(events, ["<CR>"]);
+});
+
 test("returns true when it finishes without abort", async () => {
   const { backend } = recorder();
   const completed = await runAutotype(
@@ -111,4 +149,79 @@ test("preserves case when correcting an uppercase typo", async () => {
   );
   // 'A' neighbors from 'a' = "sqwz"[0] = 's' -> uppercased 'S'
   assert.deepEqual(events, ["S", "<BS>", "A"]);
+});
+
+/**
+ * Editors auto-indent after Return, and the source text then types its own
+ * leading whitespace on top. Because each guess is based on the previous
+ * (already doubled) line, the error compounds into a pyramid. Selecting back
+ * to the line start makes the typed indentation REPLACE the editor's guess.
+ */
+test("clears the editor's auto-indent before typing an indented line", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "if x:\n    pass",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  assert.deepEqual(events, [
+    "i", "f", " ", "x", ":",
+    "<CR>", "<SEL>",
+    " ", " ", " ", " ", "p", "a", "s", "s",
+  ]);
+});
+
+test("plain prose is typed without the guard", async () => {
+  const { events, backend } = recorder();
+  await runAutotype(
+    "hello\nworld",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend, sleep: noSleep, rng: () => 0.9 },
+  );
+  assert.ok(!events.includes("<SEL>"), "no editor fights indentation in prose");
+});
+
+test("the guard can be forced on or off explicitly", async () => {
+  const forcedOn = recorder();
+  await runAutotype(
+    "a\nb",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend: forcedOn.backend, sleep: noSleep, rng: () => 0.9, guardIndent: true },
+  );
+  assert.ok(forcedOn.events.includes("<SEL>"));
+
+  const forcedOff = recorder();
+  await runAutotype(
+    "if x:\n    pass",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend: forcedOff.backend, sleep: noSleep, rng: () => 0.9, guardIndent: false },
+  );
+  assert.ok(!forcedOff.events.includes("<SEL>"));
+});
+
+test("a backend without selectToLineStart still types", async () => {
+  const events: string[] = [];
+  const bare: TypingBackend = {
+    async typeChar(ch) {
+      events.push(ch);
+    },
+    async backspace() {},
+    async pressEnter() {
+      events.push("<CR>");
+    },
+  };
+  await runAutotype(
+    "if x:\n    pass",
+    { baseDelayMs: 0, jitterMs: 0, typoRate: 0 },
+    { backend: bare, sleep: noSleep, rng: () => 0.9 },
+  );
+  assert.equal(events.join(""), "if x:<CR>    pass");
+});
+
+test("looksIndented recognises code and ignores prose", () => {
+  assert.equal(looksIndented("def f():\n    return 1"), true);
+  assert.equal(looksIndented("\tindented with a tab"), false, "no preceding newline");
+  assert.equal(looksIndented("one\ntwo\nthree"), false);
+  assert.equal(looksIndented("a\n\nb"), false, "blank lines are not indentation");
+  assert.equal(looksIndented("single line"), false);
 });

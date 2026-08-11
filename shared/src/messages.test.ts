@@ -69,3 +69,71 @@ test("rejects webrtcAnswer with empty sdp", () => {
   );
 });
 
+
+test("parses a qualityState report, including a null bitrate", () => {
+  const msg = parseAgentMessage(
+    JSON.stringify({
+      type: "qualityState",
+      width: 1536,
+      fps: 30,
+      bitrateKbps: 4200,
+      degraded: true,
+      mode: "auto",
+      buffering: false,
+      options: [{ width: 1536, fps: 30 }],
+    }),
+  );
+  assert.equal(msg.type, "qualityState");
+  if (msg.type === "qualityState") {
+    assert.equal(msg.width, 1536);
+    assert.equal(msg.degraded, true);
+  }
+
+  // Null until the adaptive controller has run a tick — must not be rejected.
+  const early = parseAgentMessage(
+    JSON.stringify({
+      type: "qualityState",
+      width: 1920,
+      fps: 60,
+      bitrateKbps: null,
+      degraded: false,
+      mode: "auto",
+      buffering: false,
+      options: [{ width: 1920, fps: 60 }],
+    }),
+  );
+  assert.equal(early.type === "qualityState" && early.bitrateKbps, null);
+});
+
+test("setQuality accepts a pinned width and null for auto", () => {
+  const pinned = ClientMessage.parse({ type: "setQuality", width: 1280 });
+  assert.equal(pinned.type === "setQuality" && pinned.width, 1280);
+  const auto = ClientMessage.parse({ type: "setQuality", width: null });
+  assert.equal(auto.type === "setQuality" && auto.width, null);
+  // A width of 0 or negative is meaningless; reject rather than clamp.
+  assert.throws(() => ClientMessage.parse({ type: "setQuality", width: 0 }));
+});
+
+test("qualityState carries mode, buffering and the pickable rungs", () => {
+  const msg = parseAgentMessage(
+    JSON.stringify({
+      type: "qualityState",
+      width: 1280,
+      fps: 59,
+      bitrateKbps: 8000,
+      degraded: false,
+      mode: "manual",
+      buffering: true,
+      options: [
+        { width: 1280, fps: 59 },
+        { width: 1024, fps: 30 },
+      ],
+    }),
+  );
+  assert.equal(msg.type, "qualityState");
+  if (msg.type === "qualityState") {
+    assert.equal(msg.mode, "manual");
+    assert.equal(msg.buffering, true);
+    assert.equal(msg.options.length, 2);
+  }
+});

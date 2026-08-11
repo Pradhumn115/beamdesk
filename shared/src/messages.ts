@@ -28,6 +28,21 @@ export const SetModeMessage = z.object({
   intervalMs: z.number().int().min(4).max(60_000),
 });
 
+/**
+ * Pick a streaming resolution, YouTube-style.
+ *
+ * `width: null` is Auto — the adaptive controller owns quality, exactly as
+ * before. A concrete width PINS that rung: the controller stops moving
+ * resolution and the link is expected to buffer rather than quietly hand back
+ * a smaller picture, because a size the viewer chose explicitly should not be
+ * overridden without them noticing.
+ */
+export const SetQualityMessage = z.object({
+  type: z.literal("setQuality"),
+  width: z.number().int().positive().nullable(),
+  fps: z.number().int().positive().optional(),
+});
+
 export const MouseButton = z.enum(["left", "right", "middle"]);
 export type MouseButton = z.infer<typeof MouseButton>;
 
@@ -193,6 +208,33 @@ export const AutotypeDoneMessage = z.object({
   cancelled: z.boolean().optional().default(false),
 });
 
+/**
+ * The stream quality the agent is currently encoding at.
+ *
+ * Sent whenever the adaptive controller changes resolution/fps, and once on
+ * connect, so the viewer can tell a genuinely soft picture from a link that
+ * quietly stepped down. Without it a degraded session is indistinguishable
+ * from a broken one.
+ */
+export const QualityStateMessage = z.object({
+  type: z.literal("qualityState"),
+  width: z.number().int().positive(),
+  fps: z.number().int().positive(),
+  /** Null until the adaptive controller has run its first tick. */
+  bitrateKbps: z.number().int().positive().nullable(),
+  /** True when the controller has stepped below the session's starting rung. */
+  degraded: z.boolean(),
+  /** "manual" once the viewer has pinned a rung; "auto" is controller-owned. */
+  mode: z.enum(["auto", "manual"]),
+  /**
+   * The link is behind and frames are queueing rather than being dropped.
+   * Only reachable in manual mode: auto stays real-time by discarding frames.
+   */
+  buffering: z.boolean(),
+  /** Selectable rungs, best first — the picker's menu. */
+  options: z.array(z.object({ width: z.number().int().positive(), fps: z.number().int().positive() })),
+});
+
 export const AgentErrorMessage = z.object({
   type: z.literal("agentError"),
   message: z.string(),
@@ -269,6 +311,7 @@ export const ClipboardContentMessage = z.object({
 export const ClientMessage = z.discriminatedUnion("type", [
   AuthMessage,
   SetModeMessage,
+  SetQualityMessage,
   MouseMessage,
   KeyMessage,
   AutotypeMessage,
@@ -294,6 +337,7 @@ export const AgentMessage = z.discriminatedUnion("type", [
   OutputVolumeStateMessage,
   DiagnosticsMessage,
   ClipboardContentMessage,
+  QualityStateMessage,
 ]);
 export type AgentMessage = z.infer<typeof AgentMessage>;
 

@@ -101,6 +101,26 @@ export interface DiagnosticsState {
   checks: DiagnosticCheck[];
 }
 
+/**
+ * What the agent is actually encoding right now.
+ *
+ * Null until the agent reports it (engines without scaling never do), so the
+ * UI can distinguish "not reported" from "reported as full resolution".
+ */
+export interface QualityStatus {
+  width: number;
+  fps: number;
+  bitrateKbps: number | null;
+  /** The adaptive controller has stepped below the session's starting rung. */
+  degraded: boolean;
+  /** "manual" once a resolution has been pinned from the picker. */
+  mode: "auto" | "manual";
+  /** Frames are queueing to hold a pinned resolution the link can't sustain. */
+  buffering: boolean;
+  /** Selectable rungs, best first. */
+  options: Array<{ width: number; fps: number }>;
+}
+
 export interface UseConnection {
   status: ConnectionStatus;
   /** Index into buildTargets()'s LAN/Tailscale/Tunnel order for the target
@@ -123,6 +143,10 @@ export interface UseConnection {
   setOutputVolume: (level: number) => void;
   setOutputMute: (muted: boolean) => void;
   diagnostics: DiagnosticsState;
+  /** Live encode resolution/fps, or null if the agent has not reported any. */
+  quality: QualityStatus | null;
+  /** Pin a streaming width (with its rung's fps), or null to return to Auto. */
+  setQuality: (width: number | null, fps?: number) => void;
   lastError: string | null;
   params: ConnectParams;
   connect: (params: ConnectParams) => void;
@@ -263,6 +287,7 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     locked: false,
     supported: false,
   });
+  const [quality, setQualityState] = useState<QualityStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsState>({
     running: false,
     checks: [],
@@ -387,6 +412,17 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
           supported: msg.supported,
           level: msg.level,
           muted: msg.muted,
+        });
+        break;
+      case "qualityState":
+        setQualityState({
+          width: msg.width,
+          fps: msg.fps,
+          bitrateKbps: msg.bitrateKbps,
+          degraded: msg.degraded,
+          mode: msg.mode,
+          buffering: msg.buffering,
+          options: msg.options,
         });
         break;
       case "diagnostics":
@@ -660,6 +696,15 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     [send],
   );
 
+  const setQuality = useCallback(
+    (width: number | null, fps?: number) => {
+      // No optimistic echo: the agent snaps the request to a real ladder rung,
+      // so showing the requested width could differ from what is encoded.
+      send({ type: "setQuality", width, fps });
+    },
+    [send],
+  );
+
   const setAudio = useCallback(
     (enabled: boolean) => {
       // Optimistic local echo; the agent confirms with an audioState message.
@@ -730,6 +775,8 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     setOutputVolume,
     setOutputMute,
     diagnostics,
+    quality,
+    setQuality,
     lastError,
     params,
     connect,

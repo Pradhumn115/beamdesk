@@ -306,6 +306,63 @@ export function App() {
             </span>
           </>
         )}
+        {connected && conn.quality && (
+          <>
+            <span className="status-sep">/</span>
+            {/* The stream's own resolution, which is NOT the agent's screen
+                size once the adaptive controller has stepped down. */}
+            <span
+              className={conn.quality.degraded ? "status-degraded" : undefined}
+              title={
+                conn.quality.degraded
+                  ? "Reduced to fit the link; recovers automatically when it improves"
+                  : "Streaming at full resolution"
+              }
+            >
+              {conn.quality.width}p @ {conn.quality.fps}fps
+              {conn.quality.bitrateKbps !== null &&
+                ` · ${Math.round(conn.quality.bitrateKbps / 100) / 10} Mbps`}
+              {conn.quality.degraded && " ↓"}
+            </span>
+            <select
+              className="quality-picker"
+              aria-label="Streaming resolution"
+              // Auto is the empty value; a pinned rung shows its own width even
+              // though the agent keeps reporting the live geometry.
+              value={
+                conn.quality.mode === "auto"
+                  ? ""
+                  : `${conn.quality.width}x${conn.quality.fps}`
+              }
+              onChange={(e) => {
+                if (e.target.value === "") return conn.setQuality(null);
+                const [w, f] = e.target.value.split("x").map(Number);
+                conn.setQuality(w, f);
+              }}
+            >
+              <option value="">
+                Auto{conn.quality.mode === "auto" ? ` (${conn.quality.width}p)` : ""}
+              </option>
+              {/* The ladder can hold two rungs at the same width but different
+                  fps (full-rate and 30fps), which would render as duplicate
+                  entries with the same value — the second unreachable. Label
+                  the fps whenever a width repeats. */}
+              {conn.quality.options.map((o, i, all) => {
+                const ambiguous = all.some((x, j) => j !== i && x.width === o.width);
+                return (
+                  <option key={`${o.width}x${o.fps}`} value={`${o.width}x${o.fps}`}>
+                    {o.width}p{ambiguous || o.fps < 30 ? ` @ ${o.fps}fps` : ""}
+                  </option>
+                );
+              })}
+            </select>
+            {conn.quality.buffering && (
+              <span className="status-buffering" title="Holding your chosen resolution; the link is behind">
+                <span className="spinner" aria-hidden="true" /> buffering
+              </span>
+            )}
+          </>
+        )}
         {conn.lastError && (
           <>
             <span className="status-sep">/</span>
