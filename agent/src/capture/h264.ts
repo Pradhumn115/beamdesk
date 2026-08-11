@@ -68,6 +68,18 @@ export interface H264CaptureOptions {
    * needs one sooner asks, and requestKeyframe() answers immediately.
    */
   gopSeconds?: number;
+  /**
+   * Size to request FROM the capture device, when the display's own default is
+   * not what you want.
+   *
+   * On a Retina Mac the device reports the logical size (1728 wide for a
+   * 3456-pixel panel), and the encode width is clamped to it -- so native
+   * detail was unreachable no matter how high the encode width was set.
+   * Requesting an explicit size lifts that ceiling. Omit to let the device
+   * choose, which is the historical behaviour.
+   */
+  captureWidth?: number;
+  captureHeight?: number;
 }
 
 const DEFAULTS = { width: 1280, fps: 30, bitrateKbps: 2500, gopSeconds: 2 };
@@ -195,12 +207,31 @@ export class H264Capture implements ScreenCapture {
   private forceKeyframe = false;
   /** Which encoder actually opened, so the choice is logged only when it changes. */
   private encoderName: string | null = null;
+  /**
+   * Rebuild the encoder on the next frame, keeping the capture device open.
+   *
+   * Bitrate is the lever the controller moves constantly, and it is purely an
+   * encoder property -- the device and decoder are indifferent to it. Tearing
+   * the whole session down for it meant reopening the screen grabber every
+   * ~2s during a ramp, which re-probes the input (the "not enough frames to
+   * estimate rate" spam), stalls capture and forces a keyframe. Industry
+   * practice is to reconfigure the encoder in place and never touch the
+   * capture source; this is the closest that libavcodec allows.
+   */
+  private encoderDirty = false;
+  /** Rebuild the scaler AND encoder on the next frame, still keeping the device. */
+  private geometryDirty = false;
+  /** Explicit capture size to request from the device, when one is wanted. */
+  private captureWidth: number | null = null;
+  private captureHeight: number | null = null;
 
   constructor(opts: H264CaptureOptions = {}) {
     this.width = opts.width ?? DEFAULTS.width;
     this.fps = opts.fps ?? DEFAULTS.fps;
     this.bitrateKbps = opts.bitrateKbps ?? DEFAULTS.bitrateKbps;
     this.gopSeconds = opts.gopSeconds ?? DEFAULTS.gopSeconds;
+    this.captureWidth = opts.captureWidth ?? null;
+    this.captureHeight = opts.captureHeight ?? null;
   }
 
   start(handler: FrameHandler): void {
@@ -244,7 +275,9 @@ export class H264Capture implements ScreenCapture {
   setBitrate(kbps: number): void {
     if (kbps === this.bitrateKbps || kbps <= 0) return;
     this.bitrateKbps = kbps;
-    if (this.running) this.restart();
+    // Applied by the pump on its next frame -- no device reopen. See
+    // encoderDirty.
+    this.encoderDirty = true;
   }
 
   /**
@@ -264,9 +297,15 @@ export class H264Capture implements ScreenCapture {
     const w = Math.max(320, Math.trunc(width / 2) * 2);
     const f = Math.min(60, Math.max(1, Math.round(fps)));
     if (w === this.width && f === this.fps) return;
+    const fpsChanged = f !== this.fps;
     this.width = w;
     this.fps = f;
-    if (this.running) this.restart();
+    if (!this.running) return;
+    // Scaling happens in the filter graph, not the device, so a width change
+    // needs only the scaler and encoder rebuilt. Frame rate is fixed when the
+    // device is opened, so that alone still costs a full restart.
+    if (fpsChanged) this.restart();
+    else this.geometryDirty = true;
   }
 
   /**
@@ -324,6 +363,15 @@ export class H264Capture implements ScreenCapture {
           if (candidate.name !== this.encoderName) {
             this.encoderName = candidate.name;
             process.stderr.write(`[h264] encoder: ${candidate.name} at ${width}x${height}\n`);
+            // Falling back to software is a real performance cliff, and it used
+            // to happen in total silence: `failures` was only reported when
+            // EVERY candidate failed. A machine with a perfectly good GPU could
+            // sit on libx264 forever with nothing to explain why.
+            if (candidate.name === SOFTWARE.name && failures.length > 0) {
+              process.stderr.write(
+                `[h264] SOFTWARE fallback -- hardware encoders unavailable: ${failures.join("; ")}\n`,
+              );
+            }
           }
           return ctx;
         }
@@ -389,6 +437,17 @@ export class H264Capture implements ScreenCapture {
     try {
       demuxer = await DeviceAPI.openScreen({
         frameRate: this.fps,
+        // Ask for the size we actually want to encode.
+        //
+        // Without this the device hands back the display's LOGICAL size (1728
+        // wide on a Retina Mac whose panel is 3456), and `min(this.width,
+        // srcW)` below then clamps everything to it -- so a higher
+        // BCSA_MAX_WIDTH silently did nothing and the stream could never carry
+        // native detail. Omitted when no explicit width is wanted, so the
+        // device keeps choosing.
+        ...(this.captureWidth && this.captureHeight
+          ? { width: this.captureWidth, height: this.captureHeight }
+          : {}),
         // Ask for what the device actually produces. ScreenCaptureKit offers
         // only nv12 and bgr0, so requesting yuv420p here made avfoundation
         // override the choice on every open; the filter graph below converts
@@ -421,9 +480,37 @@ export class H264Capture implements ScreenCapture {
       // nothing to start decoding from.
       this.forceKeyframe = true;
 
+      let w2 = w;
+      let h2 = h;
       for await (const frame of decoder.frames(demuxer.packets(stream.index))) {
         if (generation !== this.generation || !this.running) break;
         if (!frame) continue;
+
+        // Apply pending quality changes WITHOUT reopening the device.
+        if (this.geometryDirty || this.encoderDirty) {
+          const wantGeometry = this.geometryDirty;
+          this.geometryDirty = false;
+          this.encoderDirty = false;
+          if (wantGeometry) {
+            w2 = Math.trunc(Math.min(this.width, srcW) / 2) * 2;
+            h2 = Math.trunc((srcH * w2) / srcW / 2) * 2;
+            filter.close();
+            filter = FilterAPI.create(`scale=${w2}:${h2},format=yuv420p`);
+          }
+          // A live bit_rate write is what NVENC's (unmerged) reconfigure path
+          // would honour; libavcodec generally reads rate control only at open,
+          // so unless BCSA_LIVE_BITRATE says otherwise the encoder is rebuilt.
+          if (!wantGeometry && this.tryLiveBitrate(ctx)) {
+            // Reconfigured in place: no new encoder, no keyframe needed.
+          } else {
+            ctx.freeContext();
+            ctx = await this.openEncoder(w2, h2);
+            // A fresh encoder's first frame must be an IDR or the receiver has
+            // nothing to decode from.
+            this.forceKeyframe = true;
+          }
+        }
+
         await filter.process(frame);
         const scaled = await filter.receive();
         frame.free?.();
@@ -449,6 +536,26 @@ export class H264Capture implements ScreenCapture {
       filter?.close();
       decoder?.close();
       await demuxer?.close();
+    }
+  }
+
+  /**
+   * Attempt an in-place bitrate change, as NVENC's reconfigure path allows.
+   *
+   * Off by default and deliberately so: node-av exposes a writable `bitRate`
+   * mapping straight to AVCodecContext->bit_rate, but libavcodec reads rate
+   * control at open time for every encoder in this build, so the write would
+   * be accepted and silently ignored -- leaving the controller convinced it
+   * had lowered bitrate while nothing changed. Enabled with
+   * BCSA_LIVE_BITRATE=1 for measuring whether a given encoder honours it.
+   */
+  private tryLiveBitrate(ctx: CodecContext): boolean {
+    if (process.env.BCSA_LIVE_BITRATE !== "1") return false;
+    try {
+      ctx.bitRate = BigInt(this.bitrateKbps * 1000);
+      return true;
+    } catch {
+      return false;
     }
   }
 

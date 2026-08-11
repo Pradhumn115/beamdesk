@@ -96,7 +96,21 @@ async function main(): Promise<void> {
   // BCSA_H264=0 forces the old path, for comparing the two.
   const h264Wanted = process.env.BCSA_H264 !== "0";
   if (h264Wanted && (await h264CaptureAvailable())) {
-    capture = new H264Capture({ width: maxWidth, fps: Math.min(60, refreshHz) });
+    // BCSA_CAPTURE_WIDTH/HEIGHT ask the device for a specific size. Needed on
+    // Retina displays, where the device otherwise reports logical points and
+    // caps the encode width far below the panel's real resolution.
+    const captureWidth = process.env.BCSA_CAPTURE_WIDTH
+      ? Number(process.env.BCSA_CAPTURE_WIDTH)
+      : undefined;
+    const captureHeight = process.env.BCSA_CAPTURE_HEIGHT
+      ? Number(process.env.BCSA_CAPTURE_HEIGHT)
+      : undefined;
+    capture = new H264Capture({
+      width: maxWidth,
+      fps: Math.min(60, refreshHz),
+      captureWidth,
+      captureHeight,
+    });
     captureKind = `h264 in-process (max width ${maxWidth}px)`;
   } else if (ffmpegAvailable()) {
     capture = new FfmpegCapture({ maxWidth });
