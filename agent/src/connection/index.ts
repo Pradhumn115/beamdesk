@@ -886,13 +886,16 @@ export class ConnectionServer {
       // Buffering is only meaningful against the real-time threshold: past it
       // an auto session would already be dropping, so this is the point where
       // a pinned session is knowingly trading latency for the chosen size.
-      this.setBuffering(
-        this.qualityMode === "manual" && ws.bufferedAmount > MAX_QUEUED_FRAME_BYTES,
-      );
-      if (ws.bufferedAmount > dropAbove) {
+      // Measured against `queued`, NOT ws.bufferedAmount: once a QUIC session
+      // is attached the WebSocket carries only control messages and always
+      // looks idle, so backpressure never engaged on the transport actually
+      // carrying video. Frames queued in QUIC without limit while the log
+      // cheerfully reported "0 dropped" against a 674KB backlog.
+      this.setBuffering(this.qualityMode === "manual" && queued > MAX_QUEUED_FRAME_BYTES);
+      if (queued > dropAbove) {
         this.droppedFrames++;
         this.dropsSinceAdapt++;
-        this.logDroppedFrames(ws.bufferedAmount);
+        this.logDroppedFrames(queued);
         return;
       }
 

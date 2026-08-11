@@ -567,3 +567,58 @@ test("a pinned resolution survives a congested link", async () => {
   ws.close();
   await server.close();
 });
+
+/**
+ * Backpressure must follow the transport that actually carries video.
+ *
+ * Once a QUIC session attaches, frames go over WebTransport and the WebSocket
+ * carries only control messages — so measuring the WebSocket's queue meant the
+ * link always looked idle and nothing was ever dropped, however far behind
+ * QUIC fell. Observed in the wild as "[adapt] ... (backlog 674KB, 0 dropped)".
+ */
+test("drops frames when the WebTransport backlog is behind, not just the WebSocket", async () => {
+  const sent: number[] = [];
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture: fakeCapture(),
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 60,
+    webtransport: {
+      port: 4433,
+      certHash: "a".repeat(64),
+      hasSession: true,
+      // Far beyond the drop threshold: every frame must be discarded.
+      backlogBytes: 5_000_000,
+      async send(payload: Uint8Array) {
+        sent.push(payload.length);
+        return true;
+      },
+    },
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+  ws.send(encodeMessage({ type: "setMode", mode: "video", intervalMs: 17 }));
+
+  await new Promise((r) => setTimeout(r, 1500));
+  ws.close();
+  await server.close();
+
+  assert.deepEqual(
+    sent,
+    [],
+    `a saturated QUIC session must drop rather than queue, got ${sent.length} frames sent`,
+  );
+});
