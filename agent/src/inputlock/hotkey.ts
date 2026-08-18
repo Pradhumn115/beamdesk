@@ -28,14 +28,32 @@ export interface HotkeyHandle {
  * decline rather than gamble, because the cost of guessing wrong is the whole
  * agent rather than one keyboard shortcut.
  */
+/**
+ * The sliver of @nut-tree-fork/node-mac-permissions this needs.
+ *
+ * Declared locally because the package is darwin-only and therefore absent on
+ * the machines where this file still has to compile.
+ */
+interface MacPermissions {
+  getAuthStatus(type: "accessibility" | "screen"): string;
+}
+
 async function hookBlockedBecause(): Promise<string | null> {
   if (process.platform !== "darwin") return null;
   try {
+    // Imported through a variable so the specifier is not a literal.
+    //
+    // The package declares `"os": ["darwin"]`, so npm does not install it
+    // anywhere else and tsc cannot resolve its types -- which broke the build
+    // on Windows and Linux outright, on a line that never runs there. A
+    // non-literal specifier is resolved at runtime only, which is exactly the
+    // guarantee the platform check above already provides.
+    const specifier = "@nut-tree-fork/node-mac-permissions";
     // CommonJS under an ESM import: the exports arrive on `.default`, and
     // reading getAuthStatus straight off the namespace silently found
     // `undefined` -- which landed in the catch below and declined the hotkey on
     // every Mac, including the ones that had granted the permission.
-    const mod = await import("@nut-tree-fork/node-mac-permissions");
+    const mod = (await import(specifier)) as MacPermissions & { default?: MacPermissions };
     const permissions = mod.default ?? mod;
     const status = permissions.getAuthStatus("accessibility");
     if (status === "authorized") return null;
