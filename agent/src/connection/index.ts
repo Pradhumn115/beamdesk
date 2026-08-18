@@ -1373,7 +1373,7 @@ export class ConnectionServer {
             if (s.seq <= this.lastFeedbackSeq) continue;
             this.lastFeedbackSeq = s.seq;
             this.trendline.add({ sendMs: s.sendMs, arrivalMs: s.arrivalMs });
-            this.ackedRate.add({ arrivalMs: s.arrivalMs, bytes: s.bytes });
+            this.ackedRate.add({ seq: s.seq, arrivalMs: s.arrivalMs, bytes: s.bytes });
           }
           break;
         case "setQuality":

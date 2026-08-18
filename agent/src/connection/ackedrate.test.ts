@@ -4,7 +4,7 @@ import { AckedRateTracker } from "./ackedrate.js";
 
 /** `count` frames of `bytes` each, arriving every `periodMs`. */
 function stream(t: AckedRateTracker, count: number, periodMs: number, bytes: number, from = 0) {
-  for (let i = 0; i < count; i++) t.add({ arrivalMs: from + i * periodMs, bytes });
+  for (let i = 0; i < count; i++) t.add({ seq: from + i, arrivalMs: from + i * periodMs, bytes });
 }
 
 test("reports the rate the receiver actually got", () => {
@@ -18,9 +18,9 @@ test("reports the rate the receiver actually got", () => {
 test("says nothing until there is enough to say it with", () => {
   const t = new AckedRateTracker();
   assert.equal(t.rateKbps(), null, "no samples");
-  t.add({ arrivalMs: 1000, bytes: 5000 });
+  t.add({ seq: 1, arrivalMs: 1000, bytes: 5000 });
   assert.equal(t.rateKbps(), null, "one sample is not a rate");
-  t.add({ arrivalMs: 1010, bytes: 5000 });
+  t.add({ seq: 2, arrivalMs: 1010, bytes: 5000 });
   assert.equal(t.rateKbps(), null, "10ms is too short a span to extrapolate from");
 });
 
@@ -53,8 +53,28 @@ test("old samples fall out of the window", () => {
 test("out-of-order reports do not corrupt the rate", () => {
   const ordered = new AckedRateTracker();
   const shuffled = new AckedRateTracker();
-  const samples = Array.from({ length: 60 }, (_, i) => ({ arrivalMs: i * 33, bytes: 4166 }));
+  const samples = Array.from({ length: 60 }, (_, i) => ({ seq: i, arrivalMs: i * 33, bytes: 4166 }));
   for (const s of samples) ordered.add(s);
   for (const s of [...samples].reverse()) shuffled.add(s);
   assert.equal(shuffled.rateKbps(), ordered.rateKbps());
+});
+
+/**
+ * A probe is far shorter than the trailing window, so it has to be asked about
+ * on its own terms or the quiet traffic around it buries the answer.
+ */
+test("a run of frames can be measured apart from the traffic around it", () => {
+  const t = new AckedRateTracker();
+  // Ordinary traffic: ~250kbps.
+  for (let i = 0; i < 20; i++) t.add({ seq: i, arrivalMs: i * 33, bytes: 1000 });
+  // A probe burst in the middle of it: ~2400kbps over its own frames.
+  for (let i = 100; i < 120; i++) t.add({ seq: i, arrivalMs: 660 + (i - 100) * 33, bytes: 10_000 });
+  const probe = t.rateForSeqRange(100, 119)!;
+  assert.ok(probe > 2000 && probe < 3000, `expected ~2400kbps for the probe, got ${probe}`);
+});
+
+test("an unanswered range reports nothing rather than guessing", () => {
+  const t = new AckedRateTracker();
+  for (let i = 0; i < 20; i++) t.add({ seq: i, arrivalMs: i * 33, bytes: 1000 });
+  assert.equal(t.rateForSeqRange(500, 600), null);
 });

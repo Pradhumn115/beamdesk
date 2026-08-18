@@ -23,6 +23,8 @@
 
 /** One reported arrival: when the client got it, and how big it was. */
 export interface AckedSample {
+  /** The frame's sequence number, so a subset can be asked about later. */
+  seq: number;
   arrivalMs: number;
   bytes: number;
 }
@@ -78,6 +80,40 @@ export class AckedRateTracker {
     // them overstates the rate by a whole frame every window.
     const counted = bytes - (this.samples.find((s) => s.arrivalMs === oldest)?.bytes ?? 0);
     return Math.round((counted * 8) / span);
+  }
+
+  /**
+   * Rate over a specific run of frames, rather than over the trailing window.
+   *
+   * A probe lasts a fraction of an adaptation interval, so asking the ordinary
+   * window what it carried averages the probe together with the quiet traffic
+   * around it and buries the answer -- measured, every probe was diluted past
+   * its success threshold and none ever returned a verdict.
+   *
+   * Identified by sequence number rather than by time because the timestamps
+   * here are the CLIENT's, and the agent has no way to say when its own probe
+   * began in the client's clock. Sequence numbers need no such translation.
+   */
+  rateForSeqRange(fromSeq: number, toSeq: number): number | null {
+    const inRange = this.samples.filter((s) => s.seq >= fromSeq && s.seq <= toSeq);
+    if (inRange.length < 2) return null;
+    let oldest = Infinity;
+    let newest = -Infinity;
+    let bytes = 0;
+    let firstBytes = 0;
+    for (const s of inRange) {
+      if (s.arrivalMs < oldest) {
+        oldest = s.arrivalMs;
+        firstBytes = s.bytes;
+      }
+      if (s.arrivalMs > newest) newest = s.arrivalMs;
+      bytes += s.bytes;
+    }
+    const span = newest - oldest;
+    if (span <= 0) return null;
+    // As above: the opening sample marks where the span starts and so does not
+    // belong to the bytes carried across it.
+    return Math.round(((bytes - firstBytes) * 8) / span);
   }
 
   reset(): void {
