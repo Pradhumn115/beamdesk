@@ -707,3 +707,117 @@ test("returning to auto after a pin does not walk the ladder to the bottom", asy
     `must not collapse to the floor on un-pin, got ${JSON.stringify(widths)}`,
   );
 });
+
+/**
+ * A keyframe burst is a transient, not congestion.
+ *
+ * The controller read `peakBacklog` — the MAXIMUM queue depth seen during the
+ * 2s window — against ADAPT_BACKLOG_BYTES, a threshold that means "the queue is
+ * standing behind". Those are different quantities. Every GOP boundary emits an
+ * IDR carrying the whole picture, which momentarily fills the queue and drains
+ * again immediately; the peak nevertheless reported congestion on EVERY tick.
+ *
+ * Lowering the bitrate cannot shrink that burst when the resolution is pinned —
+ * an IDR's size is set by the pixel count — so the controller ratcheted 2500 ->
+ * 400kbps and stayed at the floor for the rest of the session, on a link with
+ * ten times the necessary capacity. Observed as a permanent "0.4 Mbps" in the
+ * status strip, with no dropped frames and a perfectly healthy picture.
+ */
+test("a periodic keyframe burst is not mistaken for a congested link", async () => {
+  const LINK_KBPS = 8000;
+  const FPS = 30;
+  // Drains at LINK_KBPS: a queue that a healthy link empties between bursts.
+  let queue = 0;
+  let lastDrain = Date.now();
+  const drain = () => {
+    const now = Date.now();
+    queue = Math.max(0, queue - ((LINK_KBPS * 1000) / 8) * ((now - lastDrain) / 1000));
+    lastDrain = now;
+    return queue;
+  };
+
+  let bitrateKbps = 2500;
+  let idrDue = true;
+  const capture = new CaptureLoop(async (): Promise<CapturedImage> => {
+    const avg = Math.round((bitrateKbps * 1000) / 8 / FPS);
+    // 250KB: a 1228p IDR, whose size the target bitrate cannot shrink away.
+    const size = idrDue ? 250 * 1024 : avg;
+    const keyframe = idrDue;
+    idrDue = false;
+    return { data: new Uint8Array(size), format: FrameFormat.H264, keyframe };
+  }, FPS);
+  const gop = setInterval(() => {
+    idrDue = true;
+  }, 2000);
+
+  const hooks = capture as unknown as {
+    setBitrate: (k: number) => void;
+    setScale: (w: number, f: number) => void;
+    encodeWidth: number;
+    encodeFps: number;
+  };
+  hooks.encodeWidth = 1228;
+  hooks.encodeFps = FPS;
+  hooks.setBitrate = (k) => {
+    bitrateKbps = k;
+    idrDue = true; // reopening the encoder forces an IDR
+  };
+  hooks.setScale = () => {};
+
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 60,
+    webtransport: {
+      port: 4433,
+      certHash: "a".repeat(64),
+      hasSession: true,
+      get backlogBytes() {
+        return drain();
+      },
+      async send(payload: Uint8Array) {
+        drain();
+        queue += payload.byteLength;
+        return true;
+      },
+    },
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const reported: number[] = [];
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    const msg = parseAgentMessage(data.toString());
+    if (msg.type === "qualityState" && msg.bitrateKbps !== null) reported.push(msg.bitrateKbps);
+  });
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+  ws.send(encodeMessage({ type: "setMode", mode: "video", intervalMs: Math.round(1000 / FPS) }));
+  // Pin the rung, as the viewer in the report had: this is what stops the IDR
+  // from shrinking along with the bitrate.
+  ws.send(encodeMessage({ type: "setQuality", width: 1228, fps: FPS }));
+
+  await new Promise((r) => setTimeout(r, 14000));
+  clearInterval(gop);
+  ws.close();
+  await server.close();
+
+  const settled = reported.at(-1) ?? 0;
+  assert.ok(
+    settled > 1000,
+    `a link with 8Mbps of headroom must not park at the bitrate floor; ` +
+      `settled at ${settled}kbps (series: ${JSON.stringify(reported)})`,
+  );
+});

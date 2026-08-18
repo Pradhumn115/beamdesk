@@ -323,8 +323,29 @@ export function decideLadderMove(
  * Deliberately below MAX_QUEUED_FRAME_BYTES: by the time frames are being
  * dropped the viewer has already seen the damage, so the controller reacts to
  * the queue growing rather than waiting for it to overflow.
+ *
+ * Compared against the STANDING queue — the shallowest depth seen during the
+ * window — never the peak. Those are different quantities and confusing them
+ * broke the controller outright: every GOP boundary emits an IDR carrying the
+ * whole picture, which fills the queue for a few milliseconds and drains again
+ * at once. Measured as a peak, that ordinary transient reported congestion on
+ * EVERY tick, and since an IDR's size is set by the pixel count, lowering the
+ * bitrate could not shrink it — so a pinned session ratcheted to the 400kbps
+ * floor and stayed there for good on a link with ten times the headroom, with
+ * no dropped frames and a healthy picture. A burst that drains is not
+ * congestion; only a queue that never empties is.
  */
 const ADAPT_BACKLOG_BYTES = 192 * 1024;
+
+/**
+ * Traces every adaptation tick, including the ones that change nothing.
+ *
+ * Diagnostic only, off by default: one line every ADAPT_INTERVAL_MS is far too
+ * much for an ordinary session, but it is the only way to see WHY a stuck
+ * session is stuck, since the change-log is silent exactly when the controller
+ * has stopped moving. Enable with BCSA_DEBUG_ADAPT=1.
+ */
+const DEBUG_ADAPT = process.env.BCSA_DEBUG_ADAPT === "1";
 
 /**
  * The agent's WSS server. Accepts a single authenticated controller at a time,
@@ -353,8 +374,15 @@ export class ConnectionServer {
   /** Current adaptive target; null until a capture engine that supports it starts. */
   private bitrateKbps: number | null = null;
   private adaptTimer: NodeJS.Timeout | null = null;
-  /** Worst queue depth seen since the last adaptation decision. */
+  /** Worst queue depth seen since the last adaptation decision; reported, not acted on. */
   private peakBacklog = 0;
+  /**
+   * SHALLOWEST queue depth seen since the last adaptation decision — the part
+   * of the queue that never drained. This, not the peak, is the congestion
+   * signal; see ADAPT_BACKLOG_BYTES. `null` when no frame was captured during
+   * the window, in which case the live depth is used instead.
+   */
+  private troughBacklog: number | null = null;
   /** Built once, from the width/fps the session actually started at — see buildQualityLadder. */
   private ladder: ReadonlyArray<{ width: number; fps: number }> | null = null;
   /**
@@ -588,13 +616,33 @@ export class ConnectionServer {
       // no matter how congested the link really was.
       const wt = this.deps.webtransport;
       const live = wt?.hasSession ? wt.backlogBytes : ws.bufferedAmount;
-      const backlog = Math.max(this.peakBacklog, live);
+      const peak = Math.max(this.peakBacklog, live);
+      // The queue that survived the whole window, not the tallest it ever got.
+      const standing = Math.min(this.troughBacklog ?? live, live);
       const drops = this.dropsSinceAdapt;
       this.peakBacklog = 0;
+      this.troughBacklog = null;
       this.dropsSinceAdapt = 0;
 
-      const congested = drops > 0 || backlog > ADAPT_BACKLOG_BYTES;
+      const congested = drops > 0 || standing > ADAPT_BACKLOG_BYTES;
       const ceiling = this.bitrateCeilingKbps();
+
+      // Every tick, not just the ones that change something.
+      //
+      // The interesting state is precisely the one the change-log cannot show:
+      // parked at the bitrate floor, where `next === previous` and this loop
+      // returns below without printing anything. A session stuck at 0.4Mbps
+      // therefore produced an EMPTY log, with no way to tell a genuinely
+      // saturated link from a congestion signal that never clears.
+      if (DEBUG_ADAPT) {
+        process.stderr.write(
+          `[adapt:tick] ${this.bitrateKbps}kbps/${ceiling} ${this.qualityMode} ` +
+            `rung=${this.ladderRung} congested=${congested} ` +
+            `standing=${(standing / 1024).toFixed(0)}KB (live ${(live / 1024).toFixed(0)}KB, ` +
+            `peak ${(peak / 1024).toFixed(0)}KB) drops=${drops} ` +
+            `via=${wt?.hasSession ? "quic" : "ws"} wsBuf=${(ws.bufferedAmount / 1024).toFixed(0)}KB\n`,
+        );
+      }
 
       // Resolution and frame rate move only when bitrate has run out of room.
       // Bitrate is the cheap, invisible lever; changing frame size reopens the
@@ -648,7 +696,7 @@ export class ConnectionServer {
       this.sendQualityState();
       process.stderr.write(
         `[adapt] ${previous} -> ${next} kbps ` +
-          `(${congested ? `backlog ${(backlog / 1024).toFixed(0)}KB, ${drops} dropped` : "link healthy"})\n`,
+          `(${congested ? `standing backlog ${(standing / 1024).toFixed(0)}KB (peak ${(peak / 1024).toFixed(0)}KB), ${drops} dropped` : "link healthy"})\n`,
       );
     }, ADAPT_INTERVAL_MS);
     this.adaptTimer.unref?.();
@@ -756,6 +804,7 @@ export class ConnectionServer {
       this.adaptTimer = null;
     }
     this.peakBacklog = 0;
+    this.troughBacklog = null;
     this.dropsSinceAdapt = 0;
     this.ladderRung = 0;
     this.healthyChecks = 0;
@@ -921,6 +970,7 @@ export class ConnectionServer {
       const wtSend = this.deps.webtransport;
       const queued = wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount;
       if (queued > this.peakBacklog) this.peakBacklog = queued;
+      if (this.troughBacklog === null || queued < this.troughBacklog) this.troughBacklog = queued;
       const dropAbove =
         this.deps.maxQueuedFrameBytes ??
         (this.qualityMode === "manual"
