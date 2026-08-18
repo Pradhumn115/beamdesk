@@ -17,19 +17,19 @@ import {
 test("the bitrate ceiling scales down with the encode width", () => {
   const full = bitrateCeilingForWidth(1920);
   const small = bitrateCeilingForWidth(640);
-  assert.equal(full, 20000, "the 1920 baseline must be unchanged");
+  assert.equal(full, 1_000_000, "the 1920 baseline must be the full budget");
   assert.ok(small < full, `expected a smaller ceiling at 640px, got ${small}`);
   // Area scaling: (640/1920)^2 = 1/9 of the baseline.
-  assert.equal(small, Math.round(20000 / 9));
+  assert.equal(small, Math.round(1_000_000 / 9));
 });
 
 test("a wider-than-1920 display still scales the ceiling up, capped", () => {
   assert.ok(bitrateCeilingForWidth(3456) > 20000);
-  assert.ok(bitrateCeilingForWidth(100_000) <= 60000, "cap must hold");
+  assert.ok(bitrateCeilingForWidth(100_000) <= 1_000_000, "cap must hold");
 });
 
 test("an engine without encodeWidth falls back to the baseline", () => {
-  assert.equal(bitrateCeilingForWidth(undefined), 20000);
+  assert.equal(bitrateCeilingForWidth(undefined), 1_000_000);
 });
 
 test("the ceiling never drops below the bitrate floor", () => {
@@ -42,7 +42,7 @@ test("steps down once congestion at the floor is confirmed", () => {
   const congested = {
     congested: true,
     bitrateKbps: 400,
-    ceilingKbps: 20000,
+    provenKbps: 20000,
     rungCount: RUNGS,
   };
   // Confirmation, not immediacy: a lone tick at the floor is often just
@@ -56,7 +56,7 @@ test("steps down once congestion at the floor is confirmed", () => {
 test("does not descend past the last rung", () => {
   const next = decideLadderMove(
     { rung: RUNGS - 1, healthyChecks: 0, floorChecks: 2 },
-    { congested: true, bitrateKbps: 400, ceilingKbps: 20000, rungCount: RUNGS },
+    { congested: true, bitrateKbps: 400, provenKbps: 20000, rungCount: RUNGS },
   );
   assert.equal(next.rung, RUNGS - 1);
   assert.equal(next.moved, null);
@@ -68,7 +68,7 @@ test("climbs back up after sustained health at the ceiling", () => {
   const healthy = {
     congested: false,
     bitrateKbps: 2222, // at the ceiling for this rung's width, not the 1920 one
-    ceilingKbps: 2222,
+    provenKbps: 2222,
     rungCount: RUNGS,
   };
 
@@ -90,7 +90,7 @@ test("a single congested tick resets the recovery counter", () => {
   state = decideLadderMove(state, {
     congested: true,
     bitrateKbps: 5000, // above the floor, so no step down either
-    ceilingKbps: 5000,
+    provenKbps: 5000,
     rungCount: RUNGS,
   });
   assert.equal(state.healthyChecks, 0);
@@ -100,7 +100,7 @@ test("a single congested tick resets the recovery counter", () => {
 test("health below the ceiling banks nothing", () => {
   const state = decideLadderMove(
     { rung: 2, healthyChecks: 3 },
-    { congested: false, bitrateKbps: 1000, ceilingKbps: 2222, rungCount: RUNGS },
+    { congested: false, bitrateKbps: 1000, provenKbps: 2222, rungCount: RUNGS },
   );
   assert.equal(state.healthyChecks, 0, "still ramping bitrate, not proof of headroom");
   assert.equal(state.rung, 2);
@@ -109,7 +109,7 @@ test("health below the ceiling banks nothing", () => {
 test("never climbs above the top rung", () => {
   const state = decideLadderMove(
     { rung: 0, healthyChecks: 4 },
-    { congested: false, bitrateKbps: 20000, ceilingKbps: 20000, rungCount: RUNGS },
+    { congested: false, bitrateKbps: 20000, provenKbps: 20000, rungCount: RUNGS },
   );
   assert.equal(state.rung, 0);
   assert.equal(state.moved, null);
@@ -156,7 +156,7 @@ test("a ladder built from an already-degraded width collapses to a single size",
 test("a single congested-at-the-floor tick does not cost a rung", () => {
   const next = decideLadderMove(
     { rung: 0, healthyChecks: 0, floorChecks: 0 },
-    { congested: true, bitrateKbps: 400, ceilingKbps: 20000, rungCount: RUNGS },
+    { congested: true, bitrateKbps: 400, provenKbps: 20000, rungCount: RUNGS },
   );
   assert.equal(next.rung, 0, "must wait for confirmation");
   assert.equal(next.moved, null);
@@ -167,7 +167,7 @@ test("descends only after repeated confirmation, then re-arms", () => {
   const congested = {
     congested: true,
     bitrateKbps: 400,
-    ceilingKbps: 20000,
+    provenKbps: 20000,
     rungCount: RUNGS,
   };
   let state: LadderState & { moved?: unknown } = { rung: 0, healthyChecks: 0, floorChecks: 0 };
@@ -191,7 +191,7 @@ test("recovering bitrate clears the descent evidence", () => {
   state = decideLadderMove(state, {
     congested: true,
     bitrateKbps: 5000,
-    ceilingKbps: 20000,
+    provenKbps: 20000,
     rungCount: RUNGS,
   });
   assert.equal(state.floorChecks, 0);
@@ -204,7 +204,7 @@ test("ten congested ticks cost at most three rungs, not ten", () => {
     state = decideLadderMove(state, {
       congested: true,
       bitrateKbps: 400,
-      ceilingKbps: 20000,
+      provenKbps: 20000,
       rungCount: RUNGS,
     });
   }

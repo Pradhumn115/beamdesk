@@ -156,9 +156,29 @@ const BITRATE_MIN_KBPS = 400;
  * down from here on any link that cannot sustain it, so a constrained
  * connection never pays for the higher ceiling.
  */
-const BITRATE_MAX_KBPS_AT_1920 = 20000;
+const BITRATE_MAX_KBPS_AT_1920 = 1_000_000;
 /** Upper bound on the scaled ceiling, so an unusually large display doesn't imply a bitrate no real network can sustain. */
-const BITRATE_MAX_KBPS_CAP = 60000;
+const BITRATE_MAX_KBPS_CAP = 1_000_000;
+
+/**
+ * The bitrate at which a rung counts as PROVEN, at the 1920px baseline.
+ *
+ * Deliberately not the spending ceiling above, and this separation is load-
+ * bearing. The ladder climbs back up only once bitrate has reached a ceiling
+ * (see decideLadderMove), so tying that test to the budget means raising the
+ * budget quietly disables recovery: no real link ever carries 1Gbit/s, so a
+ * session that gave up a rung would never get it back — precisely the
+ * "every step down is permanent" fault the area-scaled ceiling was introduced
+ * to cure.
+ *
+ * So the two questions are asked separately. "How many bits may this encode
+ * spend?" is a headroom question, and headroom costs nothing when unused —
+ * a static desktop spends a fraction of whatever it is offered. "Has this rung
+ * proved the link can carry it?" is a evidence question, and its answer must
+ * stay at a rate links actually reach. This is the value the ladder was tuned
+ * against before the budget was raised.
+ */
+const LADDER_PROVEN_KBPS_AT_1920 = 20000;
 const BITRATE_DOWN_FACTOR = 0.6;
 const BITRATE_UP_FACTOR = 1.15;
 
@@ -273,9 +293,25 @@ const LADDER_DOWN_CONFIRM = 3;
  * begin with).
  */
 export function bitrateCeilingForWidth(width: number | undefined): number {
-  if (!width) return BITRATE_MAX_KBPS_AT_1920;
-  const scaled = Math.round(BITRATE_MAX_KBPS_AT_1920 * (width / 1920) ** 2);
-  return Math.min(BITRATE_MAX_KBPS_CAP, Math.max(BITRATE_MIN_KBPS, scaled));
+  return scaleByArea(width, BITRATE_MAX_KBPS_AT_1920, BITRATE_MAX_KBPS_CAP);
+}
+
+/**
+ * The bitrate this width must sustain before the ladder will climb past it.
+ *
+ * Scaled by area for the same reason the spending ceiling is: a 640px encode
+ * cannot spend what 1920px can, so asking it to prove itself at the full-size
+ * rate would strand it there forever.
+ */
+export function ladderProvenForWidth(width: number | undefined): number {
+  return scaleByArea(width, LADDER_PROVEN_KBPS_AT_1920, LADDER_PROVEN_KBPS_AT_1920);
+}
+
+/** Area-scales `baseline` from 1920px to `width`, bounded by the floor and `cap`. */
+function scaleByArea(width: number | undefined, baseline: number, cap: number): number {
+  if (!width) return baseline;
+  const scaled = Math.round(baseline * (width / 1920) ** 2);
+  return Math.min(cap, Math.max(BITRATE_MIN_KBPS, scaled));
 }
 
 /** Ladder state the controller carries between adaptation ticks. */
@@ -291,14 +327,14 @@ export interface LadderState {
  * recovery rules can be tested directly.
  *
  * Down is immediate once bitrate has bottomed out; up requires
- * LADDER_RECOVERY_CHECKS consecutive ticks at the (rung-relative) ceiling,
+ * LADDER_RECOVERY_CHECKS consecutive ticks at the (rung-relative) proven rate,
  * because reopening the encoder forces a keyframe and must not oscillate.
  */
 export function decideLadderMove(
   state: LadderState,
-  input: { congested: boolean; bitrateKbps: number; ceilingKbps: number; rungCount: number },
+  input: { congested: boolean; bitrateKbps: number; provenKbps: number; rungCount: number },
 ): LadderState & { moved: "down" | "up" | null } {
-  const { congested, bitrateKbps, ceilingKbps, rungCount } = input;
+  const { congested, bitrateKbps, provenKbps, rungCount } = input;
 
   if (congested && bitrateKbps <= BITRATE_MIN_KBPS) {
     const floorChecks = (state.floorChecks ?? 0) + 1;
@@ -313,7 +349,10 @@ export function decideLadderMove(
     };
   }
 
-  if (!congested && bitrateKbps >= ceilingKbps) {
+  // Note this tests the PROVEN rate, not the bitrate ceiling. They were the
+  // same number until the spending budget was raised; see
+  // LADDER_PROVEN_KBPS_AT_1920 for why conflating them disables recovery.
+  if (!congested && bitrateKbps >= provenKbps) {
     const checks = state.healthyChecks + 1;
     if (checks >= LADDER_RECOVERY_CHECKS && state.rung > 0) {
       return { rung: state.rung - 1, healthyChecks: 0, floorChecks: 0, moved: "up" };
@@ -711,7 +750,7 @@ export class ConnectionServer {
           {
             congested,
             bitrateKbps: this.bitrateKbps,
-            ceilingKbps: ceiling,
+            provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
             rungCount: this.getLadder().length,
           },
         );
