@@ -1,7 +1,7 @@
 // Network impairment proxy, for testing the adaptive controller against a link
 // that misbehaves the way real ones do.
 //
-//   node scripts/netsim.mjs <agentPort> <listenPort> <profile>
+//   node scripts/netsim.mjs <agentPort> <listenPort> <profile> [seed]
 //   node scripts/netsim.mjs 8443 8702 cliff
 //
 // Then point a client at http://127.0.0.1:<listenPort> (browser) or connect a
@@ -34,6 +34,26 @@ import { WebSocketServer, WebSocket } from "ws";
 const AGENT_PORT = Number(process.argv[2] ?? 8700);
 const PORT = Number(process.argv[3] ?? 8702);
 const PROFILE = process.argv[4] ?? "steady";
+/**
+ * Seed for the jitter, so two runs of the same profile are comparable.
+ *
+ * Unseeded jitter made A/B testing impossible: the same configuration measured
+ * 50% and 63% link utilisation on consecutive runs, a spread far wider than any
+ * tuning change being evaluated, so every comparison was really a coin toss.
+ */
+const SEED = Number(process.argv[5] ?? 1);
+
+/** Deterministic PRNG (mulberry32) -- small, fast, and good enough for jitter. */
+function makeRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const random = makeRandom(SEED);
 
 /** kbit/s at time t, plus one-way delay and jitter. */
 const PROFILES = {
@@ -142,7 +162,7 @@ wss.on("connection", (client) => {
     queuedBytes += d.length;
     const serialiseMs = (d.length * 8) / rateNow();
     linkBusyUntil = Math.max(now, linkBusyUntil) + serialiseMs;
-    const jitter = profile.jitterMs * (Math.random() * 2 - 1);
+    const jitter = profile.jitterMs * (random() * 2 - 1);
     const arriveAt = linkBusyUntil + Math.max(0, profile.delayMs + jitter);
     setTimeout(
       () => {
@@ -181,5 +201,5 @@ wss.on("connection", (client) => {
 });
 
 server.listen(PORT, "127.0.0.1", () =>
-  console.log(`netsim "${PROFILE}" on http://127.0.0.1:${PORT} -> agent ${AGENT_PORT}`),
+  console.log(`netsim "${PROFILE}" seed=${SEED} on http://127.0.0.1:${PORT} -> agent ${AGENT_PORT}`),
 );

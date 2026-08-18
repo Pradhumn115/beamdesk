@@ -54,7 +54,20 @@ const SMOOTHING = 0.9;
 const THRESHOLD_GAIN = 4;
 /** Sample count the modified trend saturates at, so a long window cannot dominate. */
 const MAX_TREND_SAMPLES = 60;
-/** Consecutive over-threshold observations required before calling it congestion. */
+/**
+ * Consecutive over-threshold observations required before calling it congestion.
+ *
+ * Raising this to 3 was tried against a link with 80ms of delay and +/-20ms of
+ * jitter, which produces spurious congestion on roughly one tick in twenty, and
+ * made no measurable difference: spurious calls stayed at 5-6 per 54 ticks
+ * either way. Samples arrive per frame, so three of them is barely 100ms, and
+ * jitter of that size sustains a fake trend for far longer than that. Damping it
+ * would take a much longer confirmation or a higher THRESHOLD_MIN, and both
+ * trade away the responsiveness that makes this detector worth having.
+ *
+ * Left at 2 because nothing measured justified moving it. Recorded here so the
+ * experiment is not repeated blind.
+ */
 const OVERUSE_CONFIRM = 2;
 
 /** Adaptive threshold bounds and rates, from WebRTC's overuse detector. */
