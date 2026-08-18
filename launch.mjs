@@ -27,6 +27,12 @@ const C = {
 const color = (c, s) => `${C[c]}${s}${C.reset}`;
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
+// Without a listener, readline answers Ctrl-C by emitting 'pause' and nothing
+// else -- so the menu could not be interrupted either, only left via `q`.
+rl.on("SIGINT", () => {
+  rl.close();
+  process.exit(130); // 128 + SIGINT, the conventional code for this
+});
 const ask = (q) => new Promise((res) => rl.question(q, res));
 
 /** Is a CLI tool on PATH? */
@@ -140,8 +146,20 @@ function run(cmd, args) {
     // child waits on input that can't arrive and the whole run looks frozen
     // until Ctrl-C. Hand stdin over for as long as the child owns the terminal.
     rl.pause();
+    // Give the terminal back to the driver, not just to the child.
+    //
+    // readline puts a TTY into RAW mode when the interface is created, and
+    // pause() does not undo that -- only close() does. In raw mode the driver
+    // never generates SIGINT: Ctrl-C arrives as a plain 0x03 byte, which the
+    // paused readline swallows. So Ctrl-C did nothing at all while a child ran
+    // -- `npm run client` and friends could only be stopped by killing the
+    // terminal. Cooked mode restores the normal behaviour, which is exactly
+    // what this function's contract already promised: Ctrl-C stops the child.
+    const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false;
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
     const done = (result) => {
+      if (process.stdin.isTTY && wasRaw) process.stdin.setRawMode(true);
       process.stdin.resume();
       rl.resume();
       resolve(result);
