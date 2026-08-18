@@ -43,7 +43,7 @@ test("steps down once congestion at the floor is confirmed", () => {
   const congested = {
     congested: true,
     bitrateKbps: 400,
-    provenKbps: 20000,
+    starved: true,
     rungCount: RUNGS,
   };
   // Confirmation, not immediacy: a lone tick at the floor is often just
@@ -57,7 +57,7 @@ test("steps down once congestion at the floor is confirmed", () => {
 test("does not descend past the last rung", () => {
   const next = decideLadderMove(
     { rung: RUNGS - 1, healthyChecks: 0, floorChecks: 2 },
-    { congested: true, bitrateKbps: 400, provenKbps: 20000, rungCount: RUNGS },
+    { congested: true, bitrateKbps: 400, starved: true, rungCount: RUNGS },
   );
   assert.equal(next.rung, RUNGS - 1);
   assert.equal(next.moved, null);
@@ -69,7 +69,7 @@ test("climbs back up after sustained health at the ceiling", () => {
   const healthy = {
     congested: false,
     bitrateKbps: 2222, // at the ceiling for this rung's width, not the 1920 one
-    provenKbps: 2222,
+    starved: false,
     rungCount: RUNGS,
   };
 
@@ -91,26 +91,64 @@ test("a single congested tick resets the recovery counter", () => {
   state = decideLadderMove(state, {
     congested: true,
     bitrateKbps: 5000, // above the floor, so no step down either
-    provenKbps: 5000,
+    starved: false,
     rungCount: RUNGS,
   });
   assert.equal(state.healthyChecks, 0);
   assert.equal(state.rung, 2, "no move: congested but not at the floor");
 });
 
-test("health below the ceiling banks nothing", () => {
+/**
+ * A quiet link is not on its own a reason to grow the picture. If the encoder
+ * is spending everything it is allowed, more pixels would spread the same bits
+ * thinner; what it needs is more bitrate, which the controller is already
+ * pursuing. Only spare budget says the picture can afford to grow.
+ */
+test("health while the encoder is starved banks nothing", () => {
   const state = decideLadderMove(
     { rung: 2, healthyChecks: 3 },
-    { congested: false, bitrateKbps: 1000, provenKbps: 2222, rungCount: RUNGS },
+    { congested: false, bitrateKbps: 1000, starved: true, rungCount: RUNGS },
   );
-  assert.equal(state.healthyChecks, 0, "still ramping bitrate, not proof of headroom");
+  assert.equal(state.healthyChecks, 0, "short of bits at this size already");
   assert.equal(state.rung, 2);
+});
+
+test("health with bits to spare banks progress toward a climb", () => {
+  const state = decideLadderMove(
+    { rung: 2, healthyChecks: 3 },
+    { congested: false, bitrateKbps: 1000, starved: false, rungCount: RUNGS },
+  );
+  assert.equal(state.healthyChecks, 4);
+});
+
+/**
+ * The fault this replaced: recovery used to wait for the TARGET to reach a
+ * fixed rate, which a still desktop never justifies -- so a session that had
+ * stepped down stayed down until the controller ratcheted its own target up to
+ * a number it had invented. Health plus spare budget is now enough.
+ */
+test("a still screen on a quiet link still climbs back", () => {
+  let state: LadderState = { rung: 3, healthyChecks: 0, floorChecks: 0 };
+  let climbed = false;
+  for (let i = 0; i < 6; i++) {
+    const next = decideLadderMove(state, {
+      congested: false,
+      // A fraction of what a full-size picture would spend, forever.
+      bitrateKbps: 900,
+      starved: false,
+      rungCount: RUNGS,
+    });
+    state = next;
+    if (next.moved === "up") climbed = true;
+  }
+  assert.ok(climbed, "expected a climb within LADDER_RECOVERY_CHECKS ticks");
+  assert.ok(state.rung < 3, `expected to climb, still on rung ${state.rung}`);
 });
 
 test("never climbs above the top rung", () => {
   const state = decideLadderMove(
     { rung: 0, healthyChecks: 4 },
-    { congested: false, bitrateKbps: 20000, provenKbps: 20000, rungCount: RUNGS },
+    { congested: false, bitrateKbps: 20000, starved: false, rungCount: RUNGS },
   );
   assert.equal(state.rung, 0);
   assert.equal(state.moved, null);
@@ -157,7 +195,7 @@ test("a ladder built from an already-degraded width collapses to a single size",
 test("a single congested-at-the-floor tick does not cost a rung", () => {
   const next = decideLadderMove(
     { rung: 0, healthyChecks: 0, floorChecks: 0 },
-    { congested: true, bitrateKbps: 400, provenKbps: 20000, rungCount: RUNGS },
+    { congested: true, bitrateKbps: 400, starved: true, rungCount: RUNGS },
   );
   assert.equal(next.rung, 0, "must wait for confirmation");
   assert.equal(next.moved, null);
@@ -168,7 +206,7 @@ test("descends only after repeated confirmation, then re-arms", () => {
   const congested = {
     congested: true,
     bitrateKbps: 400,
-    provenKbps: 20000,
+    starved: true,
     rungCount: RUNGS,
   };
   let state: LadderState & { moved?: unknown } = { rung: 0, healthyChecks: 0, floorChecks: 0 };
@@ -192,7 +230,7 @@ test("recovering bitrate clears the descent evidence", () => {
   state = decideLadderMove(state, {
     congested: true,
     bitrateKbps: 5000,
-    provenKbps: 20000,
+    starved: false,
     rungCount: RUNGS,
   });
   assert.equal(state.floorChecks, 0);
@@ -205,7 +243,7 @@ test("ten congested ticks cost at most three rungs, not ten", () => {
     state = decideLadderMove(state, {
       congested: true,
       bitrateKbps: 400,
-      provenKbps: 20000,
+      starved: true,
       rungCount: RUNGS,
     });
   }
@@ -229,7 +267,7 @@ test("a quiet stream does not ratchet the target up to the ceiling", () => {
       previous: bitrate,
       congested: false,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: 1800,
     });
   }
@@ -247,27 +285,27 @@ test("content that really uses its budget can still climb to the ceiling", () =>
       previous: bitrate,
       congested: false,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: bitrate,
     });
   }
   assert.equal(bitrate, 1_000_000, "the raised budget must remain reachable");
 });
 
-test("the measured bound never holds the target below the proven rate", () => {
-  // Otherwise the ladder could never climb back: recovery waits for the target
-  // to reach the proven rate, and a still screen never spends that much.
+test("the measured bound never squeezes below the responsiveness floor", () => {
+  // A near-idle screen must keep enough budget to react when it stops being
+  // idle, rather than being pinned to 1.5x of almost nothing.
   let bitrate = 400;
   for (let i = 0; i < 100; i++) {
     bitrate = nextBitrateKbps({
       previous: bitrate,
       congested: false,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
-      measuredKbps: 200, // almost nothing being carried
+      floorKbps: 2500,
+      measuredKbps: 200,
     });
   }
-  assert.ok(bitrate >= 20000, `expected to reach the proven rate, got ${bitrate}kbps`);
+  assert.equal(bitrate, 2500);
 });
 
 test("before the first measurement the rule is unchanged", () => {
@@ -276,7 +314,7 @@ test("before the first measurement the rule is unchanged", () => {
       previous: 2500,
       congested: false,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: null,
     }),
     2875,
@@ -289,7 +327,7 @@ test("congestion still cuts hard, regardless of what was measured", () => {
       previous: 10000,
       congested: true,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: 9000,
     }),
     6000,
@@ -300,7 +338,7 @@ test("congestion still cuts hard, regardless of what was measured", () => {
       previous: 400,
       congested: true,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: 300,
     }),
     400,
@@ -320,7 +358,7 @@ test("congestion aims at the carried rate rather than stepping blindly down", ()
     previous: 20000,
     congested: true,
     ceilingKbps: 1_000_000,
-    provenKbps: 20000,
+    floorKbps: 2500,
     measuredKbps: 800, // what the link is really managing
   });
   assert.equal(next, 680, "0.85 of the carried rate, in one step");
@@ -333,7 +371,7 @@ test("an optimistic measurement cannot soften the response", () => {
     previous: 10000,
     congested: true,
     ceilingKbps: 1_000_000,
-    provenKbps: 20000,
+    floorKbps: 2500,
     measuredKbps: 50_000,
   });
   assert.equal(next, 6000, "falls back to the multiplicative step");
@@ -345,7 +383,7 @@ test("the floor still holds when the link is carrying almost nothing", () => {
       previous: 2000,
       congested: true,
       ceilingKbps: 1_000_000,
-      provenKbps: 20000,
+      floorKbps: 2500,
       measuredKbps: 10,
     }),
     400,
@@ -357,9 +395,48 @@ test("the target holds while a queue is still draining", () => {
     previous: 5000,
     congested: false,
     ceilingKbps: 1_000_000,
-    provenKbps: 20000,
+    floorKbps: 2500,
     measuredKbps: 5000,
     draining: true,
   });
   assert.equal(next, 5000, "adding to a draining queue just refills it");
+});
+
+/**
+ * Congestion alone must not cost resolution.
+ *
+ * If the encoder still has budget it has not spent, the link congesting says
+ * the BITRATE is wrong, not the size -- and the controller has just aimed the
+ * target at the carried rate to fix exactly that. Stepping the picture down
+ * as well would be paying twice for one problem.
+ */
+test("congestion with budget to spare does not cost a rung", () => {
+  let state: LadderState = { rung: 0, healthyChecks: 0, floorChecks: 0 };
+  for (let i = 0; i < 5; i++) {
+    state = decideLadderMove(state, {
+      congested: true,
+      bitrateKbps: 5000,
+      starved: false,
+      rungCount: RUNGS,
+    });
+  }
+  assert.equal(state.rung, 0, "bitrate is still the lever to pull");
+});
+
+test("congestion that survives a starved encoder does cost a rung", () => {
+  let state: LadderState = { rung: 0, healthyChecks: 0, floorChecks: 0 };
+  let moved: string | null = null;
+  // LADDER_DOWN_CONFIRM consecutive congested-and-starved checks.
+  for (let i = 0; i < 3; i++) {
+    const next = decideLadderMove(state, {
+      congested: true,
+      bitrateKbps: 900,
+      starved: true,
+      rungCount: RUNGS,
+    });
+    state = next;
+    moved = next.moved;
+  }
+  assert.equal(moved, "down", "no bits left to find; the picture must shrink");
+  assert.equal(state.rung, 1);
 });

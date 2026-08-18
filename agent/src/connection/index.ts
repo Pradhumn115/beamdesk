@@ -162,25 +162,6 @@ const BITRATE_MAX_KBPS_AT_1920 = 1_000_000;
 /** Upper bound on the scaled ceiling, so an unusually large display doesn't imply a bitrate no real network can sustain. */
 const BITRATE_MAX_KBPS_CAP = 1_000_000;
 
-/**
- * The bitrate at which a rung counts as PROVEN, at the 1920px baseline.
- *
- * Deliberately not the spending ceiling above, and this separation is load-
- * bearing. The ladder climbs back up only once bitrate has reached a ceiling
- * (see decideLadderMove), so tying that test to the budget means raising the
- * budget quietly disables recovery: no real link ever carries 1Gbit/s, so a
- * session that gave up a rung would never get it back — precisely the
- * "every step down is permanent" fault the area-scaled ceiling was introduced
- * to cure.
- *
- * So the two questions are asked separately. "How many bits may this encode
- * spend?" is a headroom question, and headroom costs nothing when unused —
- * a static desktop spends a fraction of whatever it is offered. "Has this rung
- * proved the link can carry it?" is a evidence question, and its answer must
- * stay at a rate links actually reach. This is the value the ladder was tuned
- * against before the budget was raised.
- */
-const LADDER_PROVEN_KBPS_AT_1920 = 20000;
 const BITRATE_DOWN_FACTOR = 0.6;
 const BITRATE_UP_FACTOR = 1.15;
 
@@ -299,14 +280,17 @@ export function bitrateCeilingForWidth(width: number | undefined): number {
 }
 
 /**
- * The bitrate this width must sustain before the ladder will climb past it.
+ * Headroom this width keeps regardless of what is currently being carried, so
+ * a still picture is not strangled the instant it starts moving.
  *
- * Scaled by area for the same reason the spending ceiling is: a 640px encode
- * cannot spend what 1920px can, so asking it to prove itself at the full-size
- * rate would strand it there forever.
+ * Scaled by area like the ceiling: fewer pixels need less of a cushion.
  */
-export function ladderProvenForWidth(width: number | undefined): number {
-  return scaleByArea(width, LADDER_PROVEN_KBPS_AT_1920, LADDER_PROVEN_KBPS_AT_1920);
+export function responsivenessFloorForWidth(width: number | undefined): number {
+  return scaleByArea(
+    width,
+    BITRATE_RESPONSIVENESS_FLOOR_AT_1920,
+    BITRATE_RESPONSIVENESS_FLOOR_AT_1920,
+  );
 }
 
 /** Area-scales `baseline` from 1920px to `width`, bounded by the floor and `cap`. */
@@ -354,6 +338,29 @@ const BITRATE_MEASURED_HEADROOM = 1.5;
 const BITRATE_DECREASE_OF_ACKED = 0.85;
 
 /**
+ * Carrying at least this fraction of the target counts as the encoder being
+ * short of bits: it is spending nearly everything it is allowed, so the
+ * constraint is the budget rather than the content.
+ */
+const BITRATE_STARVED_FRACTION = 0.85;
+
+/**
+ * Smallest budget the measured-throughput bound may impose, at 1920px.
+ *
+ * Bounding hard against what is currently carried is right for congestion
+ * control and wrong for a screen, which is mostly still and then abruptly is
+ * not. A desktop idling at 200kbit/s would be held to a 300kbit/s budget, and
+ * the moment a video started or a window was dragged the encoder would be
+ * strangled for the many ticks it takes +BITRATE_UP_FACTOR to climb back.
+ *
+ * So the bound never falls below the budget a session starts with. That is not
+ * an assumption about the link -- congestion still overrides it in one step,
+ * aimed at the carried rate -- it is headroom for content that changes faster
+ * than the controller can measure.
+ */
+const BITRATE_RESPONSIVENESS_FLOOR_AT_1920 = 2500;
+
+/**
  * Decides the next bitrate target.
  *
  * Pure so the rate rule can be tested without a link: it is the piece that has
@@ -365,7 +372,7 @@ export function nextBitrateKbps(input: {
   congested: boolean;
   ceilingKbps: number;
   /** Floor for the measured-throughput bound; see nextBitrateKbps's body. */
-  provenKbps: number;
+  floorKbps: number;
   /** Bytes actually carried, or null before the first window has elapsed. */
   measuredKbps: number | null;
   /**
@@ -374,7 +381,7 @@ export function nextBitrateKbps(input: {
    */
   draining?: boolean;
 }): number {
-  const { previous, congested, ceilingKbps, provenKbps, measuredKbps, draining } = input;
+  const { previous, congested, ceilingKbps, floorKbps, measuredKbps, draining } = input;
 
   if (congested) {
     const blind = Math.round(previous * BITRATE_DOWN_FACTOR);
@@ -392,16 +399,12 @@ export function nextBitrateKbps(input: {
 
   const raised = Math.round(previous * BITRATE_UP_FACTOR);
 
-  // Never bound BELOW the proven rate. The ladder climbs back up only once the
-  // target reaches that rate (see decideLadderMove), and a still screen costs
-  // almost nothing to encode however good the link is -- so anchoring purely to
-  // measured throughput would hold the target down at a couple of Mbit/s and
-  // strand a stepped-down session at low resolution for good. Headroom above
-  // what a quiet screen spends is exactly what lets the ladder recover.
+  // Bounded by what is actually being carried, but never squeezed below the
+  // responsiveness floor -- see BITRATE_RESPONSIVENESS_FLOOR_AT_1920.
   const evidenceBound =
     measuredKbps === null
       ? ceilingKbps
-      : Math.max(Math.round(measuredKbps * BITRATE_MEASURED_HEADROOM), provenKbps);
+      : Math.max(Math.round(measuredKbps * BITRATE_MEASURED_HEADROOM), floorKbps);
 
   return Math.min(ceilingKbps, evidenceBound, raised);
 }
@@ -424,11 +427,22 @@ export interface LadderState {
  */
 export function decideLadderMove(
   state: LadderState,
-  input: { congested: boolean; bitrateKbps: number; provenKbps: number; rungCount: number },
+  input: { congested: boolean; bitrateKbps: number; starved: boolean; rungCount: number },
 ): LadderState & { moved: "down" | "up" | null } {
-  const { congested, bitrateKbps, provenKbps, rungCount } = input;
+  const { congested, bitrateKbps, starved, rungCount } = input;
 
-  if (congested && bitrateKbps <= BITRATE_MIN_KBPS) {
+  // Give up pixels only once bitrate has stopped being the answer.
+  //
+  // This used to ask whether the target had reached its FLOOR, which worked
+  // only because the old decrease ground blindly downward until it got there.
+  // Now that congestion aims the target straight at the rate the link is
+  // carrying, the target settles where it belongs and essentially never
+  // bottoms out -- so the ladder stopped engaging at all, however bad the link
+  // got. The honest question is the mirror of the climb above: the link is
+  // still congesting AND the encoder is already spending everything it is
+  // allowed, so there are no bits left to find and the only remaining lever is
+  // fewer pixels.
+  if (congested && starved) {
     const floorChecks = (state.floorChecks ?? 0) + 1;
     const canDescend = state.rung < rungCount - 1 && floorChecks >= LADDER_DOWN_CONFIRM;
     return {
@@ -441,10 +455,23 @@ export function decideLadderMove(
     };
   }
 
-  // Note this tests the PROVEN rate, not the bitrate ceiling. They were the
-  // same number until the spending budget was raised; see
-  // LADDER_PROVEN_KBPS_AT_1920 for why conflating them disables recovery.
-  if (!congested && bitrateKbps >= provenKbps) {
+  // Climb when the link is quiet AND the encoder has bits to spare.
+  //
+  // This used to ask whether the TARGET had reached a fixed rate, which was
+  // never really a question about the link: a still desktop costs almost
+  // nothing to encode however much bandwidth is available, so the only way the
+  // target ever got there was by ratcheting up on its own. That made the
+  // ladder's evidence a number the controller had written itself.
+  //
+  // What actually decides whether more pixels are affordable is whether the
+  // encoder is short of bits at the size it is already at. If it is spending
+  // everything it is allowed, more pixels would only spread the same bits
+  // thinner, and the answer is more bitrate, not more resolution -- which the
+  // loop above is already pursuing. If it is comfortably inside its budget,
+  // the picture can afford to grow. This is the question WebRTC's QualityScaler
+  // asks of encoder QP; `starved` is the same question asked of throughput,
+  // which is what this agent can see.
+  if (!congested && !starved) {
     const checks = state.healthyChecks + 1;
     if (checks >= LADDER_RECOVERY_CHECKS && state.rung > 0) {
       return { rung: state.rung - 1, healthyChecks: 0, floorChecks: 0, moved: "up" };
@@ -849,6 +876,10 @@ export class ConnectionServer {
       // therefore produced an EMPTY log, with no way to tell a genuinely
       // saturated link from a congestion signal that never clears.
       const { trend, threshold, samples } = this.trendline.detail();
+      // Prefer what the client says it RECEIVED over what we say we sent: with
+      // a bottleneck downstream of our own socket, the agent can pour bytes
+      // into a buffer it cannot see past and count them all as progress.
+      const ackedKbps = this.ackedRate.rateKbps();
 
       if (DEBUG_ADAPT) {
         process.stderr.write(
@@ -878,7 +909,12 @@ export class ConnectionServer {
           {
             congested,
             bitrateKbps: this.bitrateKbps,
-            provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
+            // Spending nearly the whole budget means the encoder wants bits,
+            // not pixels. Unknown throughput counts as starved: without
+            // evidence the picture must not grow.
+            starved:
+              ackedKbps === null ||
+              ackedKbps >= this.bitrateKbps * BITRATE_STARVED_FRACTION,
             rungCount: this.getLadder().length,
           },
         );
@@ -890,20 +926,11 @@ export class ConnectionServer {
       }
 
       const previous = this.bitrateKbps;
-      // Prefer what the client says it RECEIVED over what we say we sent.
-      //
-      // The two differ exactly when it matters: with a bottleneck downstream of
-      // our own socket, the agent can pour bytes into a buffer it cannot see
-      // past and count them all as progress. Measured on a simulated collapse,
-      // the sender counted ~15Mbit/s leaving while the link delivered 800kbit/s.
-      // The sent figure remains the fallback, for a client too old to report
-      // arrivals -- it is still far better than no bound at all.
-      const ackedKbps = this.ackedRate.rateKbps();
       const next = nextBitrateKbps({
         previous,
         congested,
         ceilingKbps: ceiling,
-        provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
+        floorKbps: responsivenessFloorForWidth(this.deps.capture.encodeWidth),
         measuredKbps: ackedKbps ?? this.measuredKbps,
         // Hold while the queue congestion built is still draining; adding to it
         // now just refills it.
