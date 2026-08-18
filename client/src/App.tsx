@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { FRAME_HEADER_SIZE } from "@bcsa/shared";
 import type { DecodedFrame, StreamMode } from "@bcsa/shared";
 import { useConnection } from "./connect/useConnection";
 import { useAudioTranscription } from "./audio/useAudioTranscription";
@@ -85,7 +86,9 @@ export function App() {
   const wt = useWebtransport(
     useCallback(
       (frame: DecodedFrame) => {
-        noteArrival(frame);
+        // Wire size, not payload size: the agent is measuring what the link
+        // carried, and the header is on the wire too.
+        noteArrival(frame, frame.payload.byteLength + FRAME_HEADER_SIZE);
         h264.pushFrame(frame);
       },
       [noteArrival, h264],

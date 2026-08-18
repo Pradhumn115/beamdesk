@@ -156,7 +156,7 @@ export interface UseConnection {
    * WebSocket; the WebTransport path must call it itself, since those frames
    * never pass through this hook.
    */
-  noteArrival: (frame: { seq: number; timestamp: number }) => void;
+  noteArrival: (frame: { seq: number; timestamp: number }, bytes: number) => void;
   lastError: string | null;
   params: ConnectParams;
   connect: (params: ConnectParams) => void;
@@ -307,8 +307,12 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
 
   // Mutable connection state kept out of React render cycle.
   /** See noteArrival: filled once per frame, drained by the feedback flush. */
-  const arrivalsRef = useRef<Array<{ seq: number; sendMs: number; arrivalMs: number }>>([]);
-  const noteArrivalRef = useRef<(frame: { seq: number; timestamp: number }) => void>(() => {});
+  const arrivalsRef = useRef<
+    Array<{ seq: number; sendMs: number; arrivalMs: number; bytes: number }>
+  >([]);
+  const noteArrivalRef = useRef<(frame: { seq: number; timestamp: number }, bytes: number) => void>(
+    () => {},
+  );
   const wsRef = useRef<WebSocket | null>(null);
   const paramsRef = useRef<ConnectParams>(params);
   const targetIdxRef = useRef<number>(0);
@@ -573,7 +577,7 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
           } else if (isFrame(data)) {
             const decoded = decodeFrame(data);
             if (decoded) {
-              noteArrivalRef.current(decoded);
+              noteArrivalRef.current(decoded, data.byteLength);
               handleFrame(decoded);
             }
           }
@@ -699,9 +703,9 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
    * limit; the oldest samples are the ones worth losing, since the estimator
    * only cares about the recent trend.
    */
-  const noteArrival = useCallback((frame: { seq: number; timestamp: number }) => {
+  const noteArrival = useCallback((frame: { seq: number; timestamp: number }, bytes: number) => {
     const buf = arrivalsRef.current;
-    buf.push({ seq: frame.seq, sendMs: frame.timestamp, arrivalMs: Date.now() });
+    buf.push({ seq: frame.seq, sendMs: frame.timestamp, arrivalMs: Date.now(), bytes });
     if (buf.length > 512) buf.splice(0, buf.length - 512);
   }, []);
   // The socket handler is created before this callback exists, so it reaches it

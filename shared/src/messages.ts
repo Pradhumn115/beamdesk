@@ -349,6 +349,15 @@ export const TransportFeedbackMessage = z.object({
         sendMs: z.number(),
         /** When the client finished receiving it, in the CLIENT's clock. */
         arrivalMs: z.number(),
+        /**
+         * Wire size of the frame, so the agent can compute the ACKED rate.
+         *
+         * What the agent hands its transport is not what the link delivers: on
+         * a bottleneck downstream of the first hop the sender can keep dumping
+         * bytes into a buffer it cannot see past. Only the receiver knows what
+         * actually arrived.
+         */
+        bytes: z.number().int().nonnegative(),
       }),
     )
     // Bounded so a misbehaving or hostile client cannot make the agent chew

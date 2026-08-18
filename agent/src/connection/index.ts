@@ -22,6 +22,7 @@ import { runAutotype, type TypingBackend } from "../autotyper/index.js";
 import type { InputLockManager } from "../inputlock/index.js";
 import { runDiagnostics } from "../diagnostics/index.js";
 import { TrendlineEstimator } from "./trendline.js";
+import { AckedRateTracker } from "./ackedrate.js";
 import type { ClipboardBackend } from "../clipboard/index.js";
 
 export interface ServerDeps {
@@ -495,6 +496,8 @@ export class ConnectionServer {
   private readonly trendline = new TrendlineEstimator();
   /** Highest frame seq the estimator has consumed; guards replayed feedback. */
   private lastFeedbackSeq = -1;
+  /** What the CLIENT reports receiving; the anchor for the bitrate target. */
+  private readonly ackedRate = new AckedRateTracker();
   /**
    * SHALLOWEST queue depth seen since the last adaptation decision — the part
    * of the queue that never drained. This, not the peak, is the congestion
@@ -808,7 +811,8 @@ export class ConnectionServer {
             `standing=${(standing / 1024).toFixed(0)}KB (live ${(live / 1024).toFixed(0)}KB, ` +
             `peak ${(peak / 1024).toFixed(0)}KB) drops=${drops} ` +
             `via=${wt?.hasSession ? "quic" : "ws"} wsBuf=${(ws.bufferedAmount / 1024).toFixed(0)}KB ` +
-            `| gradient=${gradient} trend=${trend.toFixed(3)} thr=${threshold.toFixed(1)} n=${samples}\n`,
+            `| gradient=${gradient} trend=${trend.toFixed(3)} thr=${threshold.toFixed(1)} n=${samples} ` +
+            `acked=${this.ackedRate.rateKbps() ?? "-"}kbps sent=${this.measuredKbps ?? "-"}kbps\n`,
         );
       }
 
@@ -840,12 +844,21 @@ export class ConnectionServer {
       }
 
       const previous = this.bitrateKbps;
+      // Prefer what the client says it RECEIVED over what we say we sent.
+      //
+      // The two differ exactly when it matters: with a bottleneck downstream of
+      // our own socket, the agent can pour bytes into a buffer it cannot see
+      // past and count them all as progress. Measured on a simulated collapse,
+      // the sender counted ~15Mbit/s leaving while the link delivered 800kbit/s.
+      // The sent figure remains the fallback, for a client too old to report
+      // arrivals -- it is still far better than no bound at all.
+      const ackedKbps = this.ackedRate.rateKbps();
       const next = nextBitrateKbps({
         previous,
         congested,
         ceilingKbps: ceiling,
         provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
-        measuredKbps: this.measuredKbps,
+        measuredKbps: ackedKbps ?? this.measuredKbps,
       });
 
       // Ignore changes too small to matter: every adjustment reopens the
@@ -1257,6 +1270,7 @@ export class ConnectionServer {
             if (s.seq <= this.lastFeedbackSeq) continue;
             this.lastFeedbackSeq = s.seq;
             this.trendline.add({ sendMs: s.sendMs, arrivalMs: s.arrivalMs });
+            this.ackedRate.add({ arrivalMs: s.arrivalMs, bytes: s.bytes });
           }
           break;
         case "setQuality":
