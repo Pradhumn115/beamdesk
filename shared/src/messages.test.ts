@@ -77,6 +77,7 @@ test("parses a qualityState report, including a null bitrate", () => {
       width: 1536,
       fps: 30,
       bitrateKbps: 4200,
+      measuredKbps: 1789,
       degraded: true,
       mode: "auto",
       buffering: false,
@@ -96,6 +97,7 @@ test("parses a qualityState report, including a null bitrate", () => {
       width: 1920,
       fps: 60,
       bitrateKbps: null,
+      measuredKbps: null,
       degraded: false,
       mode: "auto",
       buffering: false,
@@ -103,6 +105,7 @@ test("parses a qualityState report, including a null bitrate", () => {
     }),
   );
   assert.equal(early.type === "qualityState" && early.bitrateKbps, null);
+  assert.equal(early.type === "qualityState" && early.measuredKbps, null);
 });
 
 test("setQuality accepts a pinned width and null for auto", () => {
@@ -121,6 +124,7 @@ test("qualityState carries mode, buffering and the pickable rungs", () => {
       width: 1280,
       fps: 59,
       bitrateKbps: 8000,
+      measuredKbps: 6100,
       degraded: false,
       mode: "manual",
       buffering: true,
@@ -135,5 +139,7 @@ test("qualityState carries mode, buffering and the pickable rungs", () => {
     assert.equal(msg.mode, "manual");
     assert.equal(msg.buffering, true);
     assert.equal(msg.options.length, 2);
+    // The strip reads this one, not the target: they differ by a lot.
+    assert.equal(msg.measuredKbps, 6100);
   }
 });

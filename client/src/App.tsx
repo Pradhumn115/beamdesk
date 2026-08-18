@@ -23,6 +23,22 @@ function fmtElapsed(ms: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/**
+ * The measured stream rate, in the unit that keeps it readable.
+ *
+ * A quiet desktop genuinely costs a few hundred kbit/s, and rounding that to
+ * "0.2 Mbps" throws away the part that moves — the number the viewer watches to
+ * tell a working link from a stalling one.
+ */
+function formatRate(kbps: number): string {
+  return kbps < 1000 ? `${Math.round(kbps)} kbps` : `${Math.round(kbps / 100) / 10} Mbps`;
+}
+
+/** The controller's target, shown on hover: a ceiling, not a speed. */
+function budgetHint(bitrateKbps: number | null): string {
+  return bitrateKbps === null ? "" : ` Encoder budget: ${formatRate(bitrateKbps)}.`;
+}
+
 export function App() {
   // Owns the Whisper worker; conn feeds it decoded audio frames.
   const audioTx = useAudioTranscription();
@@ -315,13 +331,17 @@ export function App() {
               className={conn.quality.degraded ? "status-degraded" : undefined}
               title={
                 conn.quality.degraded
-                  ? "Reduced to fit the link; recovers automatically when it improves"
-                  : "Streaming at full resolution"
+                  ? `Reduced to fit the link; recovers automatically when it improves.${budgetHint(conn.quality.bitrateKbps)}`
+                  : `Streaming at full resolution.${budgetHint(conn.quality.bitrateKbps)}`
               }
             >
               {conn.quality.width}p @ {conn.quality.fps}fps
-              {conn.quality.bitrateKbps !== null &&
-                ` · ${Math.round(conn.quality.bitrateKbps / 100) / 10} Mbps`}
+              {/* The MEASURED rate, not the controller's target. The target is
+                  a budget the encoder rarely spends in full -- a static desktop
+                  costs a fraction of it -- so showing it reported a speed the
+                  link was not carrying. */}
+              {conn.quality.measuredKbps !== null &&
+                ` · ${formatRate(conn.quality.measuredKbps)}`}
               {conn.quality.degraded && " ↓"}
             </span>
             <select

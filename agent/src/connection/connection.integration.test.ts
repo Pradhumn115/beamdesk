@@ -852,3 +852,140 @@ test("close() completes even while an idle TLS connection is open", async () => 
     idle.destroy();
   }
 });
+
+/**
+ * The strip must report what the stream costs, not what it is allowed to cost.
+ *
+ * The target bitrate is a budget the encoder rarely spends in full — a static
+ * desktop was measured at 1.8Mbit/s against a 60Mbit/s target — so a readout
+ * built on the target reported a speed the link was not carrying. It also moved
+ * only when the controller moved, which is why it appeared frozen.
+ */
+test("qualityState reports the measured stream rate, not the target", async () => {
+  const FPS = 30;
+  const BYTES_PER_FRAME = 4166; // 4166 * 30 * 8 / 1000 ~= 1000 kbit/s
+  const capture = new CaptureLoop(
+    async (): Promise<CapturedImage> => ({
+      data: new Uint8Array(BYTES_PER_FRAME),
+      format: FrameFormat.H264,
+      keyframe: true,
+    }),
+    FPS,
+  );
+  const hooks = capture as unknown as {
+    setBitrate: (k: number) => void;
+    encodeWidth: number;
+    encodeFps: number;
+  };
+  hooks.encodeWidth = 1280;
+  hooks.encodeFps = FPS;
+  hooks.setBitrate = () => {};
+
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 60,
+    // A target far above what these frames cost: the two must not be confused.
+    initialBitrateKbps: 20000,
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://127.0.0.1:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const reports: Array<{ measured: number | null; target: number | null }> = [];
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    const msg = parseAgentMessage(data.toString());
+    if (msg.type === "qualityState") {
+      reports.push({ measured: msg.measuredKbps, target: msg.bitrateKbps });
+    }
+  });
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+  ws.send(encodeMessage({ type: "setMode", mode: "video", intervalMs: Math.round(1000 / FPS) }));
+
+  await new Promise((r) => setTimeout(r, 7000));
+  ws.close();
+  await server.close();
+
+  const measured = reports.map((r) => r.measured).filter((m): m is number => m !== null);
+  assert.ok(measured.length >= 2, `expected repeated reports, got ${measured.length}`);
+  // Reported every tick, so it keeps arriving even though the target never moves.
+  const settled = measured.at(-1)!;
+  assert.ok(
+    settled > 600 && settled < 1400,
+    `expected ~1000kbps measured, got ${settled} (series: ${JSON.stringify(measured)})`,
+  );
+  // And it must be its own number, nowhere near the 20000kbps budget.
+  assert.ok(settled < 5000, `measured rate must not track the target, got ${settled}`);
+});
+
+/**
+ * The measured rate must survive on engines with no bitrate control.
+ *
+ * MJPEG and screenshot-desktop expose no setBitrate, so the adaptive controller
+ * never starts on them. Measuring inside its tick therefore left those paths
+ * with no rate to report at all — the strip simply showed nothing.
+ */
+test("the measured rate is reported even without an adaptive encoder", async () => {
+  const FPS = 20;
+  const BYTES_PER_FRAME = 6250; // 6250 * 20 * 8 / 1000 = 1000 kbit/s
+  // No setBitrate, no setScale: exactly what the MJPEG path offers.
+  const capture = new CaptureLoop(
+    async (): Promise<CapturedImage> => ({
+      data: new Uint8Array(BYTES_PER_FRAME),
+      format: FrameFormat.JPEG,
+    }),
+    FPS,
+  );
+  const server = new ConnectionServer({
+    secret: "s3cret",
+    nickname: "test-agent",
+    port: 0,
+    host: "127.0.0.1",
+    tls: ephemeralTls(),
+    input: fakeInput([]),
+    capture,
+    typingBackend: fakeTyping(),
+    inputLock: fakeInputLock(),
+    audio: new AudioCapture(null),
+    volume: new UnsupportedVolumeController(),
+    clipboard: fakeClipboard(),
+    refreshHz: 60,
+  });
+  await server.listen();
+  const ws = new WebSocket(`wss://${"127.0.0.1"}:${server.boundPort()}`, { rejectUnauthorized: false });
+  await once(ws, "open");
+  const measured: Array<number | null> = [];
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    const msg = parseAgentMessage(data.toString());
+    if (msg.type === "qualityState") measured.push(msg.measuredKbps);
+  });
+  const info = nextMessage(ws, "agentInfo");
+  ws.send(encodeMessage({ type: "auth", secret: "s3cret" }));
+  await info;
+  ws.send(encodeMessage({ type: "setMode", mode: "video", intervalMs: Math.round(1000 / FPS) }));
+
+  await new Promise((r) => setTimeout(r, 7000));
+  ws.close();
+  await server.close();
+
+  const rates = measured.filter((m): m is number => m !== null);
+  assert.ok(rates.length >= 2, `expected repeated reports, got ${JSON.stringify(measured)}`);
+  const settled = rates.at(-1)!;
+  assert.ok(
+    settled > 600 && settled < 1400,
+    `expected ~1000kbps on an engine with no bitrate control, got ${settled} (${JSON.stringify(rates)})`,
+  );
+});

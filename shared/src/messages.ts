@@ -220,8 +220,25 @@ export const QualityStateMessage = z.object({
   type: z.literal("qualityState"),
   width: z.number().int().positive(),
   fps: z.number().int().positive(),
-  /** Null until the adaptive controller has run its first tick. */
+  /**
+   * What the encoder is ALLOWED to spend — the adaptive controller's target,
+   * not what the stream costs. Null until the controller has run its first tick.
+   */
   bitrateKbps: z.number().int().positive().nullable(),
+  /**
+   * What the stream is ACTUALLY costing: bytes handed to the transport over the
+   * last reporting window, as kbit/s.
+   *
+   * The two differ by a lot and in both directions, which is why the target
+   * alone made a poor readout. A static desktop spends a fraction of its budget
+   * (measured 1.8Mbit/s against a 60Mbit/s target), so a strip showing the
+   * target reports a speed the link is not carrying; and when the controller
+   * bottomed out it read 0.4Mbit/s while the encoder was still sending far
+   * more. Only this one answers "how fast is my connection actually going".
+   *
+   * Null until a full window has elapsed.
+   */
+  measuredKbps: z.number().int().nonnegative().nullable(),
   /** True when the controller has stepped below the session's starting rung. */
   degraded: z.boolean(),
   /** "manual" once the viewer has pinned a rung; "auto" is controller-owned. */

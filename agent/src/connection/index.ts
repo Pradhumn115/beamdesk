@@ -165,6 +165,9 @@ const BITRATE_UP_FACTOR = 1.15;
 /** How often the controller reconsiders quality. */
 const ADAPT_INTERVAL_MS = 2000;
 
+/** How often the measured stream rate is recomputed and reported to the viewer. */
+const REPORT_INTERVAL_MS = 2000;
+
 /** How often close() re-destroys leftover sockets, and how long it tries. */
 const SHUTDOWN_SWEEP_MS = 50;
 const SHUTDOWN_GRACE_MS = 2000;
@@ -380,6 +383,16 @@ export class ConnectionServer {
   private adaptTimer: NodeJS.Timeout | null = null;
   /** Worst queue depth seen since the last adaptation decision; reported, not acted on. */
   private peakBacklog = 0;
+  /**
+   * Frame bytes handed to a transport since the last measurement, and when that
+   * window opened. This is what the viewer's strip reports: the target bitrate
+   * is a budget, and a static desktop spends a small fraction of it.
+   */
+  private sentBytes = 0;
+  private measureWindowAt = Date.now();
+  /** Most recent measured rate, in kbit/s; null until a window has elapsed. */
+  private measuredKbps: number | null = null;
+  private measureTimer: NodeJS.Timeout | null = null;
   /**
    * SHALLOWEST queue depth seen since the last adaptation decision — the part
    * of the queue that never drained. This, not the peak, is the congestion
@@ -638,6 +651,10 @@ export class ConnectionServer {
   private startAdapting(): void {
     if (this.adaptTimer || !this.deps.capture.setBitrate) return;
     this.bitrateKbps ??= this.deps.initialBitrateKbps ?? 2500;
+    // Open the measurement window HERE, not at construction. An agent that sat
+    // idle for a minute before a viewer arrived otherwise divided the first
+    // window's bytes by that whole minute, and the strip opened on a rate about
+    // a tenth of the truth before correcting itself.
     this.adaptTimer = setInterval(() => {
       const ws = this.controller;
       if (!ws || ws.readyState !== ws.OPEN || this.bitrateKbps === null) return;
@@ -720,20 +737,55 @@ export class ConnectionServer {
       // only engages AT the floor) could never trigger no matter how congested
       // the link became.
       const atBound = next === BITRATE_MIN_KBPS || next === ceiling;
-      if (!atBound && Math.abs(next - previous) < previous * 0.1) return;
-      if (next === previous) return;
+      const tooSmall = !atBound && Math.abs(next - previous) < previous * 0.1;
 
-      this.bitrateKbps = next;
-      this.deps.capture.setBitrate?.(next);
-      // The strip shows this number; without a report it freezes at whatever
-      // it was when the last rung change happened.
-      this.sendQualityState();
-      process.stderr.write(
-        `[adapt] ${previous} -> ${next} kbps ` +
-          `(${congested ? `standing backlog ${(standing / 1024).toFixed(0)}KB (peak ${(peak / 1024).toFixed(0)}KB), ${drops} dropped` : "link healthy"})\n`,
-      );
+      if (!tooSmall && next !== previous) {
+        this.bitrateKbps = next;
+        this.deps.capture.setBitrate?.(next);
+        process.stderr.write(
+          `[adapt] ${previous} -> ${next} kbps ` +
+            `(${congested ? `standing backlog ${(standing / 1024).toFixed(0)}KB (peak ${(peak / 1024).toFixed(0)}KB), ${drops} dropped` : "link healthy"})\n`,
+        );
+      }
+
+      if (!tooSmall && next !== previous) this.sendQualityState();
     }, ADAPT_INTERVAL_MS);
     this.adaptTimer.unref?.();
+  }
+
+  /**
+   * Reports what the stream is actually costing, every REPORT_INTERVAL_MS.
+   *
+   * Deliberately separate from the adaptive controller. Measuring is not
+   * adapting: the controller only runs on engines that expose setBitrate, and
+   * folding the measurement into its tick left the MJPEG and screenshot paths
+   * with no rate to show at all. It also reported only when the target moved,
+   * so the number froze for as long as the controller had nothing to do —
+   * while the real cost kept changing with whatever was on screen.
+   */
+  private startMeasuring(): void {
+    if (this.measureTimer) return;
+    // Opened here rather than at construction: an agent that sat idle before a
+    // viewer arrived would otherwise divide the first window's bytes by that
+    // whole idle period and open on a rate a fraction of the truth.
+    this.sentBytes = 0;
+    this.measureWindowAt = Date.now();
+    this.measureTimer = setInterval(() => {
+      const elapsedMs = Date.now() - this.measureWindowAt;
+      if (elapsedMs <= 0) return;
+      this.measuredKbps = Math.round((this.sentBytes * 8) / elapsedMs);
+      this.sentBytes = 0;
+      this.measureWindowAt = Date.now();
+      this.sendQualityState();
+    }, REPORT_INTERVAL_MS);
+    this.measureTimer.unref?.();
+  }
+
+  private stopMeasuring(): void {
+    if (this.measureTimer) {
+      clearInterval(this.measureTimer);
+      this.measureTimer = null;
+    }
   }
 
   /** Applies the current ladder rung to the encoder and says why. */
@@ -825,6 +877,7 @@ export class ConnectionServer {
       width: rung.width,
       fps: rung.fps,
       bitrateKbps: this.bitrateKbps,
+      measuredKbps: this.measuredKbps,
       degraded: this.qualityMode === "auto" && this.ladderRung > 0,
       mode: this.qualityMode,
       buffering: this.buffering,
@@ -833,6 +886,7 @@ export class ConnectionServer {
   }
 
   private stopAdapting(): void {
+    this.stopMeasuring();
     if (this.adaptTimer) {
       clearInterval(this.adaptTimer);
       this.adaptTimer = null;
@@ -993,6 +1047,7 @@ export class ConnectionServer {
    */
   private startCapture(): void {
     this.startAdapting();
+    this.startMeasuring();
     this.deps.capture.start((image) => {
       const ws = this.controller;
       if (ws?.readyState !== ws?.OPEN || !ws) return;
@@ -1041,6 +1096,10 @@ export class ConnectionServer {
       // stream, so loss in one never blocks the next, which TCP cannot offer.
       // The same envelope goes over either transport, so the client decodes
       // identically and the fallback is invisible.
+      // Counted once here rather than per transport: the same envelope goes
+      // over whichever one carries it, including the fallback below.
+      this.sentBytes += buf.byteLength;
+
       const wt = this.deps.webtransport;
       if (wt?.hasSession) {
         void wt.send(new Uint8Array(buf)).then((sent) => {

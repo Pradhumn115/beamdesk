@@ -110,7 +110,10 @@ export interface DiagnosticsState {
 export interface QualityStatus {
   width: number;
   fps: number;
+  /** The controller's target — what the encoder MAY spend, not what it does. */
   bitrateKbps: number | null;
+  /** What the stream is actually costing, measured by the agent. */
+  measuredKbps: number | null;
   /** The adaptive controller has stepped below the session's starting rung. */
   degraded: boolean;
   /** "manual" once a resolution has been pinned from the picker. */
@@ -419,6 +422,7 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
           width: msg.width,
           fps: msg.fps,
           bitrateKbps: msg.bitrateKbps,
+          measuredKbps: msg.measuredKbps,
           degraded: msg.degraded,
           mode: msg.mode,
           buffering: msg.buffering,
