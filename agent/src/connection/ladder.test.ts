@@ -440,3 +440,53 @@ test("congestion that survives a starved encoder does cost a rung", () => {
   assert.equal(moved, "down", "no bits left to find; the picture must shrink");
   assert.equal(state.rung, 1);
 });
+
+/**
+ * The measured-throughput bound caps growth. Applied as a plain minimum it also
+ * dragged healthy targets DOWN, and since the bound follows a wobbling
+ * measurement the target oscillated across it forever -- observed in the wild
+ * as 2125 -> 2444 -> 2125 -> 2444, every step logged "link healthy", every step
+ * reopening the encoder and forcing a keyframe.
+ */
+test("a healthy link is never dragged down by the bound", () => {
+  // Target above the bound, nothing congested: it must hold, not fall.
+  const held = nextBitrateKbps({
+    previous: 2444,
+    congested: false,
+    ceilingKbps: 1_000_000,
+    floorKbps: 2125,
+    measuredKbps: 900, // 1.5x this is well under the target
+  });
+  assert.equal(held, 2444, "held, so no encoder rebuild and no keyframe");
+});
+
+test("the target stops oscillating across the bound", () => {
+  // Measurement wobbling either side of the bound, as a real one does.
+  let bitrate = 2125;
+  const seen = new Set<number>();
+  for (let i = 0; i < 40; i++) {
+    bitrate = nextBitrateKbps({
+      previous: bitrate,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      floorKbps: 2125,
+      measuredKbps: i % 2 === 0 ? 900 : 1700,
+    });
+    seen.add(bitrate);
+  }
+  assert.ok(seen.size <= 3, `expected the target to settle, saw ${[...seen].join(", ")}`);
+});
+
+test("growth is still capped once the target passes the bound", () => {
+  let bitrate = 2125;
+  for (let i = 0; i < 50; i++) {
+    bitrate = nextBitrateKbps({
+      previous: bitrate,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      floorKbps: 2125,
+      measuredKbps: 1000,
+    });
+  }
+  assert.ok(bitrate <= 2500, `runaway protection must survive the fix, got ${bitrate}`);
+});

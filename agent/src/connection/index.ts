@@ -163,6 +163,17 @@ const BITRATE_MAX_KBPS_AT_1920 = 1_000_000;
 /** Upper bound on the scaled ceiling, so an unusually large display doesn't imply a bitrate no real network can sustain. */
 const BITRATE_MAX_KBPS_CAP = 1_000_000;
 
+/**
+ * How far the target must drift from what the encoder was last told before it
+ * is worth telling it again.
+ *
+ * Every change reopens the encoder and forces a keyframe. A 15% ramp step is
+ * not worth that; a change of a quarter is. Bounds are always applied
+ * regardless, since sitting just short of the floor or ceiling is exactly the
+ * case where the remaining difference matters.
+ */
+const BITRATE_APPLY_THRESHOLD = 0.25;
+
 const BITRATE_DOWN_FACTOR = 0.6;
 const BITRATE_UP_FACTOR = 1.15;
 
@@ -354,12 +365,22 @@ const BITRATE_STARVED_FRACTION = 0.85;
  * the moment a video started or a window was dragged the encoder would be
  * strangled for the many ticks it takes +BITRATE_UP_FACTOR to climb back.
  *
- * So the bound never falls below the budget a session starts with. That is not
- * an assumption about the link -- congestion still overrides it in one step,
- * aimed at the carried rate -- it is headroom for content that changes faster
- * than the controller can measure.
+ * So the bound never falls below this. That is not an assumption about the link
+ * -- congestion still overrides it in one step, aimed at the carried rate -- it
+ * is headroom for content that changes faster than the controller can measure.
+ *
+ * Sized for what a BUSY screen of this many pixels costs, not for what an idle
+ * one happens to be spending. At 2500 it was sized for neither: a 1080p session
+ * reported a 2.4Mbit/s budget on a link with far more to give, because the
+ * budget only ever grew from what quiet content asked for, and a link is never
+ * asked for more than the budget allows. The first time the picture got busy the
+ * encoder would be held to that, climbing BITRATE_UP_FACTOR per tick -- some
+ * twenty seconds of soft picture to reach a rate the link had all along.
+ *
+ * Still two orders of magnitude below BITRATE_MAX_KBPS_CAP, so it cannot
+ * reintroduce the runaway the bound exists to prevent.
  */
-const BITRATE_RESPONSIVENESS_FLOOR_AT_1920 = 2500;
+const BITRATE_RESPONSIVENESS_FLOOR_AT_1920 = 8000;
 
 /**
  * Decides the next bitrate target.
@@ -407,6 +428,21 @@ export function nextBitrateKbps(input: {
       ? ceilingKbps
       : Math.max(Math.round(measuredKbps * BITRATE_MEASURED_HEADROOM), floorKbps);
 
+  // The bound caps GROWTH; it must never drag a healthy target downward.
+  //
+  // Applied as a plain minimum it did exactly that, and the result was a
+  // permanent oscillation: the bound follows measured throughput, measured
+  // throughput wobbles across it, so the target was pulled down to the bound
+  // and ramped back up on alternate ticks, forever, both steps logged as "link
+  // healthy". Every one of those steps reopens the encoder and forces a
+  // keyframe, so a link with nothing wrong with it rebuilt its encoder every
+  // two seconds -- which is visible to the viewer as frame rate that will not
+  // settle.
+  //
+  // Holding instead costs nothing. A target above what the content is spending
+  // is not spent either; the encoder simply does not use it. Only congestion
+  // brings the target down, which is the one signal that should.
+  if (previous >= evidenceBound) return previous;
   return Math.min(ceilingKbps, evidenceBound, raised);
 }
 
@@ -547,6 +583,11 @@ export class ConnectionServer {
   private lastDropLogAt = 0;
   /** Current adaptive target; null until a capture engine that supports it starts. */
   private bitrateKbps: number | null = null;
+  /**
+   * What the encoder was last actually told, which lags the target on purpose;
+   * see BITRATE_APPLY_THRESHOLD.
+   */
+  private appliedBitrateKbps: number | null = null;
   private adaptTimer: NodeJS.Timeout | null = null;
   /** Worst queue depth seen since the last adaptation decision; reported, not acted on. */
   private peakBacklog = 0;
@@ -840,6 +881,7 @@ export class ConnectionServer {
     if (this.adaptTimer || !this.deps.capture.setBitrate) return;
     this.bitrateKbps ??= this.deps.initialBitrateKbps ?? 2500;
     this.pacer.setTargetKbps(this.bitrateKbps);
+    this.appliedBitrateKbps = null;
     // Open the measurement window HERE, not at construction. An agent that sat
     // idle for a minute before a viewer arrived otherwise divided the first
     // window's bytes by that whole minute, and the strip opened on a rate about
@@ -956,20 +998,37 @@ export class ConnectionServer {
       // 10%, so it was skipped forever, and the quality ladder below (which
       // only engages AT the floor) could never trigger no matter how congested
       // the link became.
-      const atBound = next === BITRATE_MIN_KBPS || next === ceiling;
-      const tooSmall = !atBound && Math.abs(next - previous) < previous * 0.1;
+      // The TARGET moves every tick. What the encoder is TOLD moves rarely.
+      //
+      // Reopening the encoder costs a keyframe, and a keyframe is tens of
+      // ordinary frames' worth of bytes, so applying every step of an ordinary
+      // AIMD sawtooth rebuilt the encoder every two seconds on a link with
+      // nothing wrong with it -- which the viewer sees as a frame rate that
+      // will not settle. Control and application are different questions: the
+      // controller needs to track the link closely, the encoder only needs to
+      // be roughly right, and the difference between them is free.
+      this.bitrateKbps = next;
+      this.pacer.setTargetKbps(next);
 
-      if (!tooSmall && next !== previous) {
-        this.bitrateKbps = next;
+      const applied = this.appliedBitrateKbps;
+      const atBound = next === BITRATE_MIN_KBPS || next === ceiling;
+      const worthApplying =
+        applied === null ||
+        atBound ||
+        Math.abs(next - applied) >= applied * BITRATE_APPLY_THRESHOLD;
+
+      if (worthApplying && next !== applied) {
+        this.appliedBitrateKbps = next;
         this.deps.capture.setBitrate?.(next);
-        this.pacer.setTargetKbps(next);
         process.stderr.write(
-          `[adapt] ${previous} -> ${next} kbps ` +
+          `[adapt] ${previous} -> ${next} kbps (encoder set) ` +
             `(${congested ? `standing backlog ${(standing / 1024).toFixed(0)}KB (peak ${(peak / 1024).toFixed(0)}KB), ${drops} dropped` : "link healthy"})\n`,
         );
       }
 
-      if (!tooSmall && next !== previous) this.sendQualityState();
+      // The strip reports the target, which now moves on every tick; the
+      // measurement timer sends the rest.
+      if (next !== previous) this.sendQualityState();
     }, ADAPT_INTERVAL_MS);
     this.adaptTimer.unref?.();
   }
