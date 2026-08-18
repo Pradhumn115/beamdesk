@@ -1,5 +1,6 @@
 import { Http3Server, type WebtransportSession } from "@fails-components/webtransport";
 import { generateWebtransportCert, type WebtransportCert } from "./cert.js";
+import { SessionBacklog } from "./backlog.js";
 
 /**
  * Carries video frames to the client over QUIC instead of the control
@@ -36,21 +37,10 @@ export interface WebtransportServerOptions {
 export class WebtransportServer {
   private server: Http3Server | null = null;
   private certificate: WebtransportCert | null = null;
-  /** Sessions currently able to receive frames. */
+  /** Sessions currently able to receive frames, with their outstanding bytes. */
+  private readonly backlog = new SessionBacklog();
   private sessions = new Set<WebtransportSession>();
   private closed = false;
-  /**
-   * Bytes handed to QUIC whose write has not completed yet.
-   *
-   * This is the congestion signal for the adaptive controller. QUIC applies
-   * backpressure at the stream writer: when its congestion window is full, the
-   * write simply does not resolve, so unfinished bytes accumulate here exactly
-   * as they would in a TCP send queue. Without it the controller would read the
-   * control WebSocket's queue, which on this path carries no video at all and
-   * therefore always looks idle — reporting a healthy link no matter how
-   * congested QUIC actually is.
-   */
-  private inFlight = 0;
 
   constructor(private readonly opts: WebtransportServerOptions) {}
 
@@ -68,9 +58,20 @@ export class WebtransportServer {
     return this.sessions.size > 0;
   }
 
-  /** Bytes written to QUIC but not yet flushed; the congestion signal. */
+  /**
+   * Bytes written to QUIC but not yet flushed; the congestion signal.
+   *
+   * QUIC applies backpressure at the stream writer: when its congestion window
+   * is full the write simply does not resolve, so unfinished bytes accumulate
+   * here exactly as they would in a TCP send queue. Without it the controller
+   * would read the control WebSocket's queue, which on this path carries no
+   * video at all and therefore always looks idle.
+   *
+   * Counted per session -- see SessionBacklog for why a single counter leaked
+   * and what that leak did.
+   */
   get backlogBytes(): number {
-    return this.inFlight;
+    return this.backlog.bytes;
   }
 
   async start(): Promise<void> {
@@ -108,6 +109,7 @@ export class WebtransportServer {
     try {
       await session.ready;
       this.sessions.add(session);
+      this.backlog.open(session);
       process.stderr.write("[webtransport] client attached\n");
       await session.closed;
     } catch {
@@ -115,6 +117,9 @@ export class WebtransportServer {
       // stays on the WebSocket path, which is why that path is never removed.
     } finally {
       this.sessions.delete(session);
+      // Whatever this session still had in flight goes with it. Those writes
+      // may settle later or never; either way nobody is reading their account.
+      this.backlog.close(session);
     }
   }
 
@@ -130,20 +135,20 @@ export class WebtransportServer {
     if (this.sessions.size === 0) return false;
     let sent = false;
     for (const session of this.sessions) {
-      this.inFlight += payload.byteLength;
+      const settle = this.backlog.begin(session, payload.byteLength);
       try {
         const stream = await session.createUnidirectionalStream();
         const writer = stream.getWriter();
         // These awaits are the measurement: QUIC withholds completion while its
         // congestion window is full, so a congested link keeps bytes counted in
-        // `inFlight` rather than acknowledging them.
+        // the backlog rather than acknowledging them.
         await writer.write(payload);
         await writer.close();
         sent = true;
       } catch {
         // Drop this frame for this session; a later keyframe recovers it.
       } finally {
-        this.inFlight -= payload.byteLength;
+        settle();
       }
     }
     return sent;
