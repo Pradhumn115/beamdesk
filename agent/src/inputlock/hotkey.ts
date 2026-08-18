@@ -45,7 +45,23 @@ async function hookBlockedBecause(): Promise<string | null> {
   }
 }
 
-export async function registerLockHotkey(onToggle: () => void): Promise<HotkeyHandle> {
+export interface HotkeyOptions {
+  /**
+   * Return true to ignore a trigger.
+   *
+   * uiohook watches the OS-wide key stream and cannot tell a physical key from
+   * one the agent injected, so a Ctrl+Alt+L that the agent itself produced --
+   * or a plain "l" typed while a latched Ctrl+Alt made it look like one --
+   * would toggle the lock in the middle of a run. The caller knows when it is
+   * driving the keyboard; this lets it say so.
+   */
+  suppressed?: () => boolean;
+}
+
+export async function registerLockHotkey(
+  onToggle: () => void,
+  options: HotkeyOptions = {},
+): Promise<HotkeyHandle> {
   const blocked = await hookBlockedBecause();
   if (blocked) {
     process.stderr.write(
@@ -59,6 +75,7 @@ export async function registerLockHotkey(onToggle: () => void): Promise<HotkeyHa
     const { uIOhook, UiohookKey } = mod;
 
     const onKeydown = (e: { keycode: number; ctrlKey: boolean; altKey: boolean }) => {
+      if (options.suppressed?.()) return;
       if (e.ctrlKey && e.altKey && e.keycode === UiohookKey.L) onToggle();
     };
     uIOhook.on("keydown", onKeydown);

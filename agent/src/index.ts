@@ -8,6 +8,7 @@ import { detectRefreshHz, detectScreenPixels } from "./display.js";
 import { InputController } from "./input/index.js";
 import { createNutBackend } from "./input/nutBackend.js";
 import { createNutTypingBackend } from "./autotyper/nutTyping.js";
+import { createWindowsTypingBackend } from "./autotyper/winTyping.js";
 import { ConnectionServer } from "./connection/index.js";
 import { H264Capture, h264CaptureAvailable } from "./capture/h264.js";
 import { WebtransportServer } from "./webtransport/server.js";
@@ -46,8 +47,32 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const tls = loadOrCreateTls();
 
-  const input = new InputController(await createNutBackend());
-  const typingBackend = await createNutTypingBackend();
+  // Windows first: nut-js resolves each character through VkKeyScan() there and
+  // presses whatever modifiers that lookup reports, so AltGr punctuation
+  // ({}[]\\|@~ on most non-US layouts) arrives as Ctrl+Alt and a character the
+  // layout lacks arrives as Shift+Ctrl+Alt with an arbitrary virtual key -- in
+  // a browser, Ctrl+T. The helper types via KEYEVENTF_UNICODE instead, which
+  // consults no layout and presses no modifier. See autotyper/winTyping.ts.
+  const windowsTyper = await createWindowsTypingBackend();
+  if (process.platform === "win32" && !windowsTyper) {
+    process.stderr.write(
+      "[autotype] falling back to nut-js typing on Windows; " +
+        "characters outside the active keyboard layout may trigger shortcuts\n",
+    );
+  }
+  const typingBackend = windowsTyper ?? (await createNutTypingBackend());
+
+  // Remote keystrokes take the same character path, so they get the same
+  // protection.
+  const input = new InputController(
+    await createNutBackend({ typeChar: windowsTyper?.typeChar.bind(windowsTyper) }),
+    {
+      onStaleRelease: (count) =>
+        process.stderr.write(
+          `[input] released ${count} key(s) held with no matching key-up\n`,
+        ),
+    },
+  );
   const clipboard = await createNutClipboardBackend();
   // Detect the loopback device once and share it between AudioCapture (Classic
   // audio) — detectLoopbackDevice() spawns
@@ -193,7 +218,10 @@ async function main(): Promise<void> {
   printBanner(config.port, config.secret, tls.fingerprint, captureKind, isElevated());
 
   // Optional agent-side toggle hotkey (Ctrl+Alt+L); no-ops if unavailable.
-  const hotkey = await registerLockHotkey(() => void inputLock.toggle());
+  const hotkey = await registerLockHotkey(() => void inputLock.toggle(), {
+    // Never let the agent's own keystrokes toggle the lock out from under a run.
+    suppressed: () => server.isAutotyping,
+  });
 
   const shutdown = async (): Promise<void> => {
     process.stdout.write("\nShutting down…\n");

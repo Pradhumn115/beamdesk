@@ -1,4 +1,5 @@
 import type { AutotypeProfile } from "@bcsa/shared";
+import { prepareText, type PrepReport } from "./textPrep.js";
 
 /** Backend that actually emits keystrokes. Kept minimal for testability. */
 export interface TypingBackend {
@@ -22,6 +23,31 @@ export interface TypingBackend {
    * simply types without the guard.
    */
   selectToLineStart?(): Promise<void>;
+  /**
+   * Press a real Tab key. Optional, and deliberately unused by default -- see
+   * PrepOptions.expandTabs for why a tab is usually the wrong thing to send.
+   */
+  pressTab?(): Promise<void>;
+  /**
+   * Release anything this backend might still be holding.
+   *
+   * Called before a run starts and after it ends. A modifier left down turns
+   * every following keystroke into a shortcut, and the cost of asking is one
+   * key event against the cost of an unbounded stream of stray commands.
+   */
+  releaseAll?(): Promise<void>;
+  /** Free any helper process. Called on agent shutdown. */
+  dispose?(): void;
+  /**
+   * True when characters are delivered without consulting the OS keyboard
+   * layout -- macOS CGEventKeyboardSetUnicodeString, Windows KEYEVENTF_UNICODE.
+   *
+   * A layout-resolving backend cannot type a character the active layout
+   * lacks, and libnut's Windows path answers that case by pressing
+   * Shift+Ctrl+Alt with an arbitrary virtual key. Callers fold text to ASCII
+   * before handing it to a backend that reports false.
+   */
+  readonly layoutSafe?: boolean;
 }
 
 export interface AutotypeHooks {
@@ -44,6 +70,19 @@ export interface AutotypeDeps {
    * ordinary prose.
    */
   guardIndent?: boolean;
+  /**
+   * Send tabs as a real Tab key press instead of expanding them to spaces.
+   *
+   * Off by default. A Tab keystroke moves focus in a browser, and every
+   * character after that lands wherever focus went -- on a page body, where
+   * bare letters are application shortcuts. Only enable it for a target known
+   * to treat Tab as indentation.
+   */
+  literalTabs?: boolean;
+  /** Columns a tab expands to when literalTabs is off. Default 4. */
+  tabWidth?: number;
+  /** Called once with what sanitisation changed, for logging. */
+  onPrepared?: (report: PrepReport) => void;
 }
 
 /**
@@ -96,24 +135,58 @@ function pickTypo(ch: string, rng: () => number): string | null {
  * whole text, false if it was cancelled.
  */
 export async function runAutotype(
-  text: string,
+  rawText: string,
   profile: AutotypeProfile,
   deps: AutotypeDeps,
   hooks: AutotypeHooks = {},
 ): Promise<boolean> {
   const sleep = deps.sleep ?? defaultSleep;
   const rng = deps.rng ?? Math.random;
+
+  // Sanitise before a single key event goes out. Characters that resolve to
+  // commands rather than text -- tabs that move focus, control codes, and (for
+  // a layout-resolving backend) anything absent from the active layout -- are
+  // removed here rather than defended against downstream.
+  const { text, report } = prepareText(rawText, {
+    expandTabs: !deps.literalTabs,
+    tabWidth: deps.tabWidth,
+    foldTypographic: deps.backend.layoutSafe !== true,
+  });
+  deps.onPrepared?.(report);
+
   const total = text.length;
   const guardIndent = deps.guardIndent ?? looksIndented(text);
+
+  // Start from a known-clean modifier state. If a previous run or a dropped
+  // remote key-up left one latched, every character below would be a shortcut.
+  await deps.backend.releaseAll?.();
 
   const delay = (): number => {
     const jitter = (rng() * 2 - 1) * profile.jitterMs;
     return Math.max(0, Math.round(profile.baseDelayMs + jitter));
   };
 
+  try {
+    return await typeLoop();
+  } finally {
+    // Whatever happened -- finished, cancelled, or threw part-way through a
+    // modifier combo -- the machine is handed back with nothing held down.
+    await deps.backend.releaseAll?.().catch(() => {});
+  }
+
+  async function typeLoop(): Promise<boolean> {
   for (let i = 0; i < text.length; i++) {
     if (deps.signal?.aborted) return false; // cancelled before this keystroke
     const ch = text[i];
+
+    // Only reachable with literalTabs on; otherwise prepareText already turned
+    // tabs into spaces.
+    if (ch === "\t") {
+      await deps.backend.pressTab?.();
+      hooks.onProgress?.(i + 1, total);
+      if (i < text.length - 1) await sleep(delay());
+      continue;
+    }
 
     // Line breaks are key presses, not characters. Swallow the CR of a CRLF
     // pair so "\r\n" produces a single Return rather than two.
@@ -149,4 +222,5 @@ export async function runAutotype(
     if (i < text.length - 1) await sleep(delay());
   }
   return true;
+  }
 }
