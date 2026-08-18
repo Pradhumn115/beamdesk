@@ -21,6 +21,7 @@ import type { InputController } from "../input/index.js";
 import { runAutotype, type TypingBackend } from "../autotyper/index.js";
 import type { InputLockManager } from "../inputlock/index.js";
 import { runDiagnostics } from "../diagnostics/index.js";
+import { TrendlineEstimator } from "./trendline.js";
 import type { ClipboardBackend } from "../clipboard/index.js";
 
 export interface ServerDeps {
@@ -433,6 +434,14 @@ export class ConnectionServer {
   private measuredKbps: number | null = null;
   private measureTimer: NodeJS.Timeout | null = null;
   /**
+   * Delay-gradient congestion detector, running in the SHADOW: it is fed real
+   * timings and logged beside the live queue-depth signal, but decides nothing.
+   * The two are being compared on real links before either is trusted alone.
+   */
+  private readonly trendline = new TrendlineEstimator();
+  /** Highest frame seq the estimator has consumed; guards replayed feedback. */
+  private lastFeedbackSeq = -1;
+  /**
    * SHALLOWEST queue depth seen since the last adaptation decision — the part
    * of the queue that never drained. This, not the peak, is the congestion
    * signal; see ADAPT_BACKLOG_BYTES. `null` when no frame was captured during
@@ -574,6 +583,9 @@ export class ConnectionServer {
     this.deps.capture.stop();
     this.deps.audio.stop();
     await this.deps.inputLock.unlock();
+    await this.deps.input.releaseAllKeys().catch(() => {});
+    this.deps.input.stop();
+    this.deps.typingBackend.dispose?.();
     this.controller?.close();
     await new Promise<void>((resolve) => {
       if (!this.wss) return resolve();
@@ -724,13 +736,25 @@ export class ConnectionServer {
       // returns below without printing anything. A session stuck at 0.4Mbps
       // therefore produced an EMPTY log, with no way to tell a genuinely
       // saturated link from a congestion signal that never clears.
+      // Side by side, so a disagreement between the two detectors is visible
+      // on a real link rather than inferred from a simulation.
+      const gradient = this.trendline.current();
+      const { trend, threshold, samples } = this.trendline.detail();
+      if (gradient === "overusing" && !congested) {
+        process.stderr.write(
+          `[adapt:shadow] delay gradient says CONGESTED while the queue says healthy ` +
+            `(trend ${trend.toFixed(3)}ms/ms vs threshold ${threshold.toFixed(1)}, ${samples} samples)\n`,
+        );
+      }
+
       if (DEBUG_ADAPT) {
         process.stderr.write(
           `[adapt:tick] ${this.bitrateKbps}kbps/${ceiling} ${this.qualityMode} ` +
             `rung=${this.ladderRung} congested=${congested} ` +
             `standing=${(standing / 1024).toFixed(0)}KB (live ${(live / 1024).toFixed(0)}KB, ` +
             `peak ${(peak / 1024).toFixed(0)}KB) drops=${drops} ` +
-            `via=${wt?.hasSession ? "quic" : "ws"} wsBuf=${(ws.bufferedAmount / 1024).toFixed(0)}KB\n`,
+            `via=${wt?.hasSession ? "quic" : "ws"} wsBuf=${(ws.bufferedAmount / 1024).toFixed(0)}KB ` +
+            `| gradient=${gradient} trend=${trend.toFixed(3)} thr=${threshold.toFixed(1)} n=${samples}\n`,
         );
       }
 
@@ -1014,6 +1038,10 @@ export class ConnectionServer {
         this.controller = null;
         this.autotyping = false;
         this.autotypeAbort?.abort(); // stop any in-progress autotype
+        // The client is gone and cannot send the key-ups for anything it left
+        // down. A modifier held past this point would corrupt every keystroke
+        // the machine sees from now on, including its owner's.
+        void this.deps.input.releaseAllKeys();
         this.deps.capture.stop();
         this.stopAdapting();
         this.deps.audio.stop();
@@ -1163,15 +1191,33 @@ export class ConnectionServer {
           this.startCapture();
           this.deps.capture.setInterval(msg.intervalMs);
           break;
+        case "transportFeedback":
+          for (const s of msg.samples) {
+            // Ordered and de-duplicated here rather than in the estimator: it
+            // measures queueing, and a replayed or out-of-order report says
+            // nothing about that.
+            if (s.seq <= this.lastFeedbackSeq) continue;
+            this.lastFeedbackSeq = s.seq;
+            this.trendline.add({ sendMs: s.sendMs, arrivalMs: s.arrivalMs });
+          }
+          break;
         case "setQuality":
           this.applyQualityChoice(msg.width, msg.fps);
           break;
         case "mouse":
           this.deps.inputLock.noteClientActivity();
+          if (this.autotyping) break; // see the "key" case below
           await this.deps.input.applyMouse(msg);
           break;
         case "key":
           this.deps.inputLock.noteClientActivity();
+          // Drop remote input while a run is in progress. Messages are
+          // dispatched fire-and-forget, so a stray keystroke from the client
+          // interleaves with the typed text -- and a modifier landing between
+          // two characters makes every character after it a shortcut until its
+          // key-up arrives. Cancelling the run is the way to take back control;
+          // "cancelAutotype" is handled below and is deliberately not gated.
+          if (this.autotyping) break;
           await this.deps.input.applyKey(msg);
           break;
         case "autotype":
@@ -1372,6 +1418,12 @@ export class ConnectionServer {
     const abort = new AbortController();
     this.autotypeAbort = abort;
     try {
+      // Start clean: a modifier the client left down would turn the whole run
+      // into a stream of shortcuts.
+      const stale = await this.deps.input.releaseAllKeys();
+      if (stale > 0) {
+        process.stderr.write(`[autotype] released ${stale} stale key(s) before typing\n`);
+      }
       const completed = await runAutotype(
         text,
         profile,
@@ -1382,6 +1434,7 @@ export class ConnectionServer {
     } finally {
       this.autotyping = false;
       this.autotypeAbort = null;
+      await this.deps.input.releaseAllKeys().catch(() => {});
     }
   }
 }

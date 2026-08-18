@@ -150,6 +150,13 @@ export interface UseConnection {
   quality: QualityStatus | null;
   /** Pin a streaming width (with its rung's fps), or null to return to Auto. */
   setQuality: (width: number | null, fps?: number) => void;
+  /**
+   * Records when a video frame arrived, for the agent's delay-gradient
+   * congestion estimator. Called automatically for frames that come over the
+   * WebSocket; the WebTransport path must call it itself, since those frames
+   * never pass through this hook.
+   */
+  noteArrival: (frame: { seq: number; timestamp: number }) => void;
   lastError: string | null;
   params: ConnectParams;
   connect: (params: ConnectParams) => void;
@@ -299,6 +306,9 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
   const [params, setParams] = useState<ConnectParams>(loadParams);
 
   // Mutable connection state kept out of React render cycle.
+  /** See noteArrival: filled once per frame, drained by the feedback flush. */
+  const arrivalsRef = useRef<Array<{ seq: number; sendMs: number; arrivalMs: number }>>([]);
+  const noteArrivalRef = useRef<(frame: { seq: number; timestamp: number }) => void>(() => {});
   const wsRef = useRef<WebSocket | null>(null);
   const paramsRef = useRef<ConnectParams>(params);
   const targetIdxRef = useRef<number>(0);
@@ -562,7 +572,10 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
             if (audioFrame) onAudioFrameRef.current?.(audioFrame);
           } else if (isFrame(data)) {
             const decoded = decodeFrame(data);
-            if (decoded) handleFrame(decoded);
+            if (decoded) {
+              noteArrivalRef.current(decoded);
+              handleFrame(decoded);
+            }
           }
         }
       };
@@ -677,6 +690,24 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     [clearTimers, revokeCurrentUrl],
   );
 
+  /**
+   * Frame arrival timings awaiting the next feedback flush.
+   *
+   * A ref, not state: this is touched once per frame (up to 60/s) and must
+   * never trigger a re-render. Bounded because a client that stops flushing —
+   * socket wedged, tab throttled in the background — must not grow this without
+   * limit; the oldest samples are the ones worth losing, since the estimator
+   * only cares about the recent trend.
+   */
+  const noteArrival = useCallback((frame: { seq: number; timestamp: number }) => {
+    const buf = arrivalsRef.current;
+    buf.push({ seq: frame.seq, sendMs: frame.timestamp, arrivalMs: Date.now() });
+    if (buf.length > 512) buf.splice(0, buf.length - 512);
+  }, []);
+  // The socket handler is created before this callback exists, so it reaches it
+  // through a ref rather than capturing a stale binding.
+  noteArrivalRef.current = noteArrival;
+
   const send = useCallback((msg: ClientMessage) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -766,6 +797,20 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     };
   }, [clearTimers, revokeCurrentUrl]);
 
+  // Batched rather than sent per frame: one message per frame would put 60
+  // control messages a second on the socket carrying the video, which is
+  // exactly the queue this is meant to measure.
+  useEffect(() => {
+    if (status !== "connected") return;
+    const timer = setInterval(() => {
+      const samples = arrivalsRef.current;
+      if (samples.length === 0) return;
+      arrivalsRef.current = [];
+      send({ type: "transportFeedback", samples });
+    }, 250);
+    return () => clearInterval(timer);
+  }, [status, send]);
+
   return {
     status,
     connectedTargetIndex,
@@ -781,6 +826,7 @@ export function useConnection(opts: UseConnectionOptions = {}): UseConnection {
     diagnostics,
     quality,
     setQuality,
+    noteArrival,
     lastError,
     params,
     connect,

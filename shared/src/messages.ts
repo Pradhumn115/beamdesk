@@ -325,6 +325,37 @@ export const ClipboardContentMessage = z.object({
 
 // ---- unions ----
 
+/**
+ * Per-frame arrival timings, reported back so the agent can measure the
+ * one-way delay GRADIENT — the signal WebRTC's congestion control is built on.
+ *
+ * The agent's own send queue only grows once a bottleneck is already saturated,
+ * which makes it a lagging indicator. Delay starts rising while the bottleneck
+ * is still filling, so it leads. Measuring it needs the receiver's clock,
+ * hence this message.
+ *
+ * Absolute clock agreement is NOT required: the estimator uses only differences
+ * between consecutive frames, in which any fixed offset cancels. `sendMs` is
+ * echoed from the frame header rather than looked up, so the agent needs to
+ * keep no per-frame state.
+ */
+export const TransportFeedbackMessage = z.object({
+  type: z.literal("transportFeedback"),
+  samples: z
+    .array(
+      z.object({
+        seq: z.number().int().nonnegative(),
+        /** The frame header's timestamp, in the AGENT's clock. */
+        sendMs: z.number(),
+        /** When the client finished receiving it, in the CLIENT's clock. */
+        arrivalMs: z.number(),
+      }),
+    )
+    // Bounded so a misbehaving or hostile client cannot make the agent chew
+    // through an unbounded array on the control path.
+    .max(512),
+});
+
 export const ClientMessage = z.discriminatedUnion("type", [
   AuthMessage,
   SetModeMessage,
@@ -340,6 +371,7 @@ export const ClientMessage = z.discriminatedUnion("type", [
   RunDiagnosticsMessage,
   GetClipboardMessage,
   SetClipboardMessage,
+  TransportFeedbackMessage,
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { StreamMode } from "@bcsa/shared";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { DecodedFrame, StreamMode } from "@bcsa/shared";
 import { useConnection } from "./connect/useConnection";
 import { useAudioTranscription } from "./audio/useAudioTranscription";
 import { useAudioPlayback } from "./audio/useAudioPlayback";
@@ -68,7 +68,6 @@ export function App() {
   // Video can arrive over QUIC instead of the control socket. Frames carry the
   // same envelope either way, so both feed the same decoder and the fallback is
   // invisible to everything downstream.
-  const wt = useWebtransport(h264.pushFrame);
   const conn = useConnection({
     onAudioFrame: (frame) => {
       // One stream, two independent consumers: transcribing ignores it when
@@ -78,6 +77,20 @@ export function App() {
     },
     onVideoFrame: h264.pushFrame,
   });
+  // Declared AFTER conn so QUIC frames can be timed the same way socket frames
+  // are. They never pass through useConnection, so without this the agent's
+  // delay-gradient estimator would go blind on exactly the transport that
+  // carries the video.
+  const noteArrival = conn.noteArrival;
+  const wt = useWebtransport(
+    useCallback(
+      (frame: DecodedFrame) => {
+        noteArrival(frame);
+        h264.pushFrame(frame);
+      },
+      [noteArrival, h264],
+    ),
+  );
   // The agent's volume lives on another machine, so the slider needs to follow
   // the finger locally and reconcile with the machine afterwards.
   const agentVolume = useRemoteSlider(conn.outputVolume.level, conn.setOutputVolume);
