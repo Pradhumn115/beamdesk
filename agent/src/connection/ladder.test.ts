@@ -4,6 +4,7 @@ import {
   bitrateCeilingForWidth,
   buildQualityLadder,
   decideLadderMove,
+  nextBitrateKbps,
   type LadderState,
 } from "./index.js";
 
@@ -209,4 +210,99 @@ test("ten congested ticks cost at most three rungs, not ten", () => {
     });
   }
   assert.equal(state.rung, 3, `expected 10 ticks / 3 confirmations = 3 rungs, got ${state.rung}`);
+});
+
+/**
+ * The target must stay anchored to evidence.
+ *
+ * With nothing to bound it, the target climbs BITRATE_UP_FACTOR every tick for
+ * as long as nothing congests. Measured on an idle loopback link it reached
+ * 770Mbit/s while the stream genuinely cost 1.8Mbit/s -- a number the encoder is
+ * entitled to spend the instant the content stops being quiet, on a link never
+ * tested anywhere near it.
+ */
+test("a quiet stream does not ratchet the target up to the ceiling", () => {
+  let bitrate = 2500;
+  // A still desktop: ~1.8Mbit/s actually carried, whatever it is offered.
+  for (let i = 0; i < 100; i++) {
+    bitrate = nextBitrateKbps({
+      previous: bitrate,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: 1800,
+    });
+  }
+  assert.ok(
+    bitrate <= 20000,
+    `expected the target to settle near the proven rate, got ${bitrate}kbps`,
+  );
+});
+
+test("content that really uses its budget can still climb to the ceiling", () => {
+  let bitrate = 2500;
+  for (let i = 0; i < 200; i++) {
+    // A busy screen spends everything it is given.
+    bitrate = nextBitrateKbps({
+      previous: bitrate,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: bitrate,
+    });
+  }
+  assert.equal(bitrate, 1_000_000, "the raised budget must remain reachable");
+});
+
+test("the measured bound never holds the target below the proven rate", () => {
+  // Otherwise the ladder could never climb back: recovery waits for the target
+  // to reach the proven rate, and a still screen never spends that much.
+  let bitrate = 400;
+  for (let i = 0; i < 100; i++) {
+    bitrate = nextBitrateKbps({
+      previous: bitrate,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: 200, // almost nothing being carried
+    });
+  }
+  assert.ok(bitrate >= 20000, `expected to reach the proven rate, got ${bitrate}kbps`);
+});
+
+test("before the first measurement the rule is unchanged", () => {
+  assert.equal(
+    nextBitrateKbps({
+      previous: 2500,
+      congested: false,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: null,
+    }),
+    2875,
+  );
+});
+
+test("congestion still cuts hard, regardless of what was measured", () => {
+  assert.equal(
+    nextBitrateKbps({
+      previous: 10000,
+      congested: true,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: 9000,
+    }),
+    6000,
+  );
+  // And never below the floor.
+  assert.equal(
+    nextBitrateKbps({
+      previous: 400,
+      congested: true,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: 300,
+    }),
+    400,
+  );
 });

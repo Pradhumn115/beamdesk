@@ -315,6 +315,60 @@ function scaleByArea(width: number | undefined, baseline: number, cap: number): 
   return Math.min(cap, Math.max(BITRATE_MIN_KBPS, scaled));
 }
 
+/**
+ * How far above the rate actually being carried the target may climb.
+ *
+ * WebRTC bounds its estimate to roughly this multiple of the ACKED rate, and
+ * for the same reason: a target far above anything the link has been observed
+ * to carry is a guess with no evidence behind it. Without the bound the target
+ * simply ratchets +BITRATE_UP_FACTOR every tick for as long as nothing
+ * congests, which on a quiet link compounds to ten times in half a minute --
+ * measured running to 770Mbit/s against a stream genuinely costing 1.8Mbit/s.
+ * That is not free: it is the number handed to the encoder, and the moment the
+ * content stops being quiet the encoder is entitled to spend all of it, in one
+ * burst, on a link that was never tested at anything like that rate.
+ *
+ * 1.5 leaves ample room to grow -- 50% per tick, far more than the 15% the
+ * controller actually steps -- so this never binds while the encoder is really
+ * using its budget. It binds only when the budget is fiction.
+ */
+const BITRATE_MEASURED_HEADROOM = 1.5;
+
+/**
+ * Decides the next bitrate target.
+ *
+ * Pure so the rate rule can be tested without a link: it is the piece that has
+ * been wrong most often, and it was previously reachable only through a live
+ * socket.
+ */
+export function nextBitrateKbps(input: {
+  previous: number;
+  congested: boolean;
+  ceilingKbps: number;
+  /** Floor for the measured-throughput bound; see nextBitrateKbps's body. */
+  provenKbps: number;
+  /** Bytes actually carried, or null before the first window has elapsed. */
+  measuredKbps: number | null;
+}): number {
+  const { previous, congested, ceilingKbps, provenKbps, measuredKbps } = input;
+  if (congested) return Math.max(BITRATE_MIN_KBPS, Math.round(previous * BITRATE_DOWN_FACTOR));
+
+  const raised = Math.round(previous * BITRATE_UP_FACTOR);
+
+  // Never bound BELOW the proven rate. The ladder climbs back up only once the
+  // target reaches that rate (see decideLadderMove), and a still screen costs
+  // almost nothing to encode however good the link is -- so anchoring purely to
+  // measured throughput would hold the target down at a couple of Mbit/s and
+  // strand a stepped-down session at low resolution for good. Headroom above
+  // what a quiet screen spends is exactly what lets the ladder recover.
+  const evidenceBound =
+    measuredKbps === null
+      ? ceilingKbps
+      : Math.max(Math.round(measuredKbps * BITRATE_MEASURED_HEADROOM), provenKbps);
+
+  return Math.min(ceilingKbps, evidenceBound, raised);
+}
+
 /** Ladder state the controller carries between adaptation ticks. */
 export interface LadderState {
   rung: number;
@@ -786,9 +840,13 @@ export class ConnectionServer {
       }
 
       const previous = this.bitrateKbps;
-      const next = congested
-        ? Math.max(BITRATE_MIN_KBPS, Math.round(previous * BITRATE_DOWN_FACTOR))
-        : Math.min(ceiling, Math.round(previous * BITRATE_UP_FACTOR));
+      const next = nextBitrateKbps({
+        previous,
+        congested,
+        ceilingKbps: ceiling,
+        provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
+        measuredKbps: this.measuredKbps,
+      });
 
       // Ignore changes too small to matter: every adjustment reopens the
       // encoder and emits a keyframe, which costs far more bytes than a 3%
