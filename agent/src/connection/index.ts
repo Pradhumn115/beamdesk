@@ -921,8 +921,8 @@ export class ConnectionServer {
         this.ladderRung = decision.rung;
         this.healthyChecks = decision.healthyChecks;
         this.floorChecks = decision.floorChecks ?? 0;
-        if (decision.moved === "down") this.applyRung("still congested at the bitrate floor");
-        if (decision.moved === "up") this.applyRung("link sustained at full bitrate");
+        if (decision.moved === "down") this.applyRung("congested with no bitrate left to give");
+        if (decision.moved === "up") this.applyRung("link quiet with bitrate to spare");
       }
 
       const previous = this.bitrateKbps;

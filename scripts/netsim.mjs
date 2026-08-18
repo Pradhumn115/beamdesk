@@ -115,45 +115,43 @@ wss.on("connection", (client) => {
     else pending.push({ d, bin });
   });
 
-  // Agent -> client is the metered direction. A token bucket drains the queue
-  // at the current rate; anything arriving faster waits, which is exactly the
-  // standing queue a real bottleneck builds.
-  const outbox = [];
-  let draining = false;
-  const pump = () => {
-    if (draining) return;
-    draining = true;
-    const step = () => {
-      const item = outbox.shift();
-      if (!item) {
-        draining = false;
-        return;
-      }
-      queuedBytes -= item.d.length;
-      const jitter = profile.jitterMs * (Math.random() * 2 - 1);
-      setTimeout(
-        () => {
-          if (client.readyState === WebSocket.OPEN) client.send(item.d, { binary: item.bin });
-          sentBytes += item.d.length;
-        },
-        Math.max(0, profile.delayMs + jitter),
-      );
-      // Serialisation delay at the current capacity: bytes*8/kbit = ms.
-      setTimeout(step, (item.d.length * 8) / rateNow());
-    };
-    step();
-  };
+  // Agent -> client is the metered direction, modelled store-and-forward.
+  //
+  // A frame occupies the link for as long as its bytes take to serialise at the
+  // current capacity, and arrives when its LAST byte lands -- not when its
+  // first does. Getting that backwards is what made an earlier version of this
+  // useless for testing congestion control: frames were handed over at the
+  // moment they entered the queue and the delay was applied afterwards, so
+  // arrival timestamps recorded queue-entry time. Every delay-gradient reading
+  // taken through it was measuring the wrong thing, and a 200KB keyframe that
+  // genuinely monopolises an 800kbit/s link for two seconds looked instant.
+  //
+  // `linkBusyUntil` is the serialisation model: each frame starts transmitting
+  // when the one before it finishes, which is precisely how a queue behind a
+  // bottleneck builds the rising delay that congestion control exists to see.
+  let linkBusyUntil = 0;
   upstream.on("message", (d, bin) => {
+    const now = Date.now();
     // Drop-tail, as a real bottleneck behaves. Without a bound the queue simply
     // grows without limit and the proxy stops resembling a network: measured at
-    // 42MB backlog and zero delivery, which no router would ever do.
+    // 42MB backlog and zero delivery, which no router would do.
     if (queuedBytes + d.length > MAX_QUEUE_BYTES) {
       dropped++;
       return;
     }
-    outbox.push({ d, bin });
     queuedBytes += d.length;
-    pump();
+    const serialiseMs = (d.length * 8) / rateNow();
+    linkBusyUntil = Math.max(now, linkBusyUntil) + serialiseMs;
+    const jitter = profile.jitterMs * (Math.random() * 2 - 1);
+    const arriveAt = linkBusyUntil + Math.max(0, profile.delayMs + jitter);
+    setTimeout(
+      () => {
+        queuedBytes -= d.length;
+        if (client.readyState === WebSocket.OPEN) client.send(d, { binary: bin });
+        sentBytes += d.length;
+      },
+      Math.max(0, arriveAt - now),
+    );
   });
 
   const bye = () => {
