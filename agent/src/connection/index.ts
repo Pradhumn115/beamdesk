@@ -165,6 +165,10 @@ const BITRATE_UP_FACTOR = 1.15;
 /** How often the controller reconsiders quality. */
 const ADAPT_INTERVAL_MS = 2000;
 
+/** How often close() re-destroys leftover sockets, and how long it tries. */
+const SHUTDOWN_SWEEP_MS = 50;
+const SHUTDOWN_GRACE_MS = 2000;
+
 /**
  * Each resolution rung is this fraction of the previous rung's width.
  *
@@ -521,11 +525,41 @@ export class ConnectionServer {
     this.controller?.close();
     await new Promise<void>((resolve) => {
       if (!this.wss) return resolve();
+      // wss.close() waits for every client to finish its close handshake, and a
+      // peer that has gone away never sends one. Shutdown cannot be held
+      // hostage by a half-open tab.
+      for (const client of this.wss.clients) client.terminate();
       this.wss.close(() => resolve());
     });
     await new Promise<void>((resolve) => {
-      if (!this.https) return resolve();
-      this.https.close(() => resolve());
+      const https = this.https;
+      if (!https) return resolve();
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearInterval(sweep);
+        clearTimeout(cap);
+        resolve();
+      };
+      https.close(() => finish());
+      // Idle keep-alive sockets are why close() alone was not enough.
+      //
+      // Node counts a connection as outstanding until it actually ends, and an
+      // idle one never does -- a browser leaves several behind after fetching
+      // the certificate-accept page. close() therefore waited forever, the
+      // SIGINT handler in index.ts never reached process.exit(0), and Ctrl+C
+      // printed "Shutting down..." and then hung with no way out but kill -9.
+      //
+      // Swept rather than called once: closeAllConnections() destroys only the
+      // sockets the server has registered SO FAR, and a TLS handshake still in
+      // flight lands after it, holding the server open just as before.
+      https.closeAllConnections();
+      const sweep = setInterval(() => https.closeAllConnections(), SHUTDOWN_SWEEP_MS);
+      sweep.unref?.();
+      // Last resort. Whatever a socket manages to do, quitting must terminate.
+      const cap = setTimeout(finish, SHUTDOWN_GRACE_MS);
+      cap.unref?.();
     });
   }
 

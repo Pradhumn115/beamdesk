@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { connect as tlsConnect } from "node:tls";
 import WebSocket from "ws";
 import selfsigned from "selfsigned";
 import {
@@ -820,4 +821,34 @@ test("a periodic keyframe burst is not mistaken for a congested link", async () 
     `a link with 8Mbps of headroom must not park at the bitrate floor; ` +
       `settled at ${settled}kbps (series: ${JSON.stringify(reported)})`,
   );
+});
+
+/**
+ * close() must not be held open by a socket the peer never closes.
+ *
+ * Node's `server.close()` waits for every open connection to end, and an idle
+ * keep-alive TLS socket never does — a browser leaves several behind after
+ * fetching the certificate-accept page. So close() never resolved, the SIGINT
+ * handler in index.ts never reached process.exit(0), and Ctrl+C printed
+ * "Shutting down…" and then hung forever with no way out but kill -9.
+ */
+test("close() completes even while an idle TLS connection is open", async () => {
+  const server = await startServer("s3cret", []);
+  // A connection that finishes the handshake and then just sits there.
+  const idle = tlsConnect({
+    host: "127.0.0.1",
+    port: server.boundPort(),
+    rejectUnauthorized: false,
+  });
+  await once(idle, "secureConnect");
+
+  const closed = server.close();
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("close() did not resolve within 5s")), 5000),
+  );
+  try {
+    await Promise.race([closed, timeout]);
+  } finally {
+    idle.destroy();
+  }
 });
