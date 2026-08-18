@@ -468,6 +468,14 @@ export class ConnectionServer {
   private seq = 0;
   private audioSeq = 0;
   private autotyping = false;
+
+  /**
+   * Whether a run is in progress, for anything that must not react to the
+   * agent's own keystrokes -- see registerLockHotkey's `suppressed` option.
+   */
+  get isAutotyping(): boolean {
+    return this.autotyping;
+  }
   private autotypeAbort: AbortController | null = null;
   /** Frames dropped for backpressure since the last log line. */
   private droppedFrames = 0;
