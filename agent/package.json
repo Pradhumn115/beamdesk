@@ -27,6 +27,7 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
+    "@nut-tree-fork/node-mac-permissions": "^2.2.1",
     "uiohook-napi": "^1.5.4"
   },
   "devDependencies": {

@@ -12,7 +12,48 @@ export interface HotkeyHandle {
   stop(): void;
 }
 
+/**
+ * Whether uIOhook.start() is safe to call, or the reason it is not.
+ *
+ * macOS refuses OS-wide key capture without Accessibility permission, and
+ * libuiohook answers that refusal by calling abort() on its own hook thread:
+ * it prints "hook_run [pid]: Accessibility API is disabled!" and takes the
+ * process down with SIGABRT. That is asynchronous and native, so the try/catch
+ * around start() below never sees it — the agent simply died at boot with exit
+ * code 134, on any machine whose terminal had not been granted Accessibility.
+ * A best-effort hotkey must not be able to do that, so the permission is
+ * checked BEFORE the hook is ever started.
+ *
+ * Only a positive "authorized" clears it. If the check itself is unavailable we
+ * decline rather than gamble, because the cost of guessing wrong is the whole
+ * agent rather than one keyboard shortcut.
+ */
+async function hookBlockedBecause(): Promise<string | null> {
+  if (process.platform !== "darwin") return null;
+  try {
+    // CommonJS under an ESM import: the exports arrive on `.default`, and
+    // reading getAuthStatus straight off the namespace silently found
+    // `undefined` -- which landed in the catch below and declined the hotkey on
+    // every Mac, including the ones that had granted the permission.
+    const mod = await import("@nut-tree-fork/node-mac-permissions");
+    const permissions = mod.default ?? mod;
+    const status = permissions.getAuthStatus("accessibility");
+    if (status === "authorized") return null;
+    return `macOS Accessibility permission is "${status}" — grant it in System Settings › Privacy & Security › Accessibility`;
+  } catch (err) {
+    return `macOS Accessibility permission could not be checked (${String(err)})`;
+  }
+}
+
 export async function registerLockHotkey(onToggle: () => void): Promise<HotkeyHandle> {
+  const blocked = await hookBlockedBecause();
+  if (blocked) {
+    process.stderr.write(
+      `[inputlock] global hotkey unavailable: ${blocked}; use the client toggle instead.\n`,
+    );
+    return { stop() {} };
+  }
+
   try {
     const mod = await import("uiohook-napi");
     const { uIOhook, UiohookKey } = mod;
