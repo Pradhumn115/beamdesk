@@ -336,6 +336,24 @@ function scaleByArea(width: number | undefined, baseline: number, cap: number): 
 const BITRATE_MEASURED_HEADROOM = 1.5;
 
 /**
+ * Where the target lands when congestion is detected and the carried rate is
+ * known: just under what the link has been shown to manage.
+ *
+ * Multiplying the previous TARGET down instead is a blind step, and its size is
+ * wrong whenever the target has drifted away from reality. Measured against a
+ * link collapsing from 10Mbit/s to 800kbit/s, the target sat at 20Mbit/s: at
+ * BITRATE_DOWN_FACTOR per tick that is nine ticks -- eighteen seconds of the
+ * encoder being told it may spend twenty times what the link can carry, which
+ * is eighteen seconds of the viewer watching a slideshow. Aiming at the carried
+ * rate gets there in one.
+ *
+ * The same 0.85 WebRTC uses, and for the same reason: landing exactly ON the
+ * observed rate leaves nothing spare to drain the queue that congestion just
+ * built.
+ */
+const BITRATE_DECREASE_OF_ACKED = 0.85;
+
+/**
  * Decides the next bitrate target.
  *
  * Pure so the rate rule can be tested without a link: it is the piece that has
@@ -350,9 +368,27 @@ export function nextBitrateKbps(input: {
   provenKbps: number;
   /** Bytes actually carried, or null before the first window has elapsed. */
   measuredKbps: number | null;
+  /**
+   * The delay gradient says the queue built by congestion is still draining.
+   * Adding to it now simply refills it, so the target holds where it is.
+   */
+  draining?: boolean;
 }): number {
-  const { previous, congested, ceilingKbps, provenKbps, measuredKbps } = input;
-  if (congested) return Math.max(BITRATE_MIN_KBPS, Math.round(previous * BITRATE_DOWN_FACTOR));
+  const { previous, congested, ceilingKbps, provenKbps, measuredKbps, draining } = input;
+
+  if (congested) {
+    const blind = Math.round(previous * BITRATE_DOWN_FACTOR);
+    // Aim just under what the link is actually carrying, when that is known.
+    // Never ABOVE the blind step, so a stale or optimistic measurement can only
+    // make the response more decisive, never less.
+    const aimed =
+      measuredKbps === null
+        ? blind
+        : Math.min(blind, Math.round(measuredKbps * BITRATE_DECREASE_OF_ACKED));
+    return Math.max(BITRATE_MIN_KBPS, aimed);
+  }
+
+  if (draining) return previous;
 
   const raised = Math.round(previous * BITRATE_UP_FACTOR);
 
@@ -791,7 +827,18 @@ export class ConnectionServer {
       this.troughBacklog = null;
       this.dropsSinceAdapt = 0;
 
-      const congested = drops > 0 || standing > ADAPT_BACKLOG_BYTES;
+      // Three independent witnesses, any of which is sufficient.
+      //
+      // The queue and the drop counter only ever see a bottleneck in OUR OWN
+      // send buffer. Anything further out -- a router, a tunnel, the far end's
+      // downlink -- is invisible to them: measured against a link collapsing
+      // from 10Mbit/s to 800kbit/s, both reported perfect health for the entire
+      // collapse while the delay gradient called it on six ticks out of seven.
+      // The gradient reads the receiver's arrival times, so it sees queueing
+      // wherever it happens, and sees it while the queue is still filling
+      // rather than once it has overflowed.
+      const gradient = this.trendline.current();
+      const congested = drops > 0 || standing > ADAPT_BACKLOG_BYTES || gradient === "overusing";
       const ceiling = this.bitrateCeilingKbps();
 
       // Every tick, not just the ones that change something.
@@ -801,16 +848,7 @@ export class ConnectionServer {
       // returns below without printing anything. A session stuck at 0.4Mbps
       // therefore produced an EMPTY log, with no way to tell a genuinely
       // saturated link from a congestion signal that never clears.
-      // Side by side, so a disagreement between the two detectors is visible
-      // on a real link rather than inferred from a simulation.
-      const gradient = this.trendline.current();
       const { trend, threshold, samples } = this.trendline.detail();
-      if (gradient === "overusing" && !congested) {
-        process.stderr.write(
-          `[adapt:shadow] delay gradient says CONGESTED while the queue says healthy ` +
-            `(trend ${trend.toFixed(3)}ms/ms vs threshold ${threshold.toFixed(1)}, ${samples} samples)\n`,
-        );
-      }
 
       if (DEBUG_ADAPT) {
         process.stderr.write(
@@ -867,6 +905,9 @@ export class ConnectionServer {
         ceilingKbps: ceiling,
         provenKbps: ladderProvenForWidth(this.deps.capture.encodeWidth),
         measuredKbps: ackedKbps ?? this.measuredKbps,
+        // Hold while the queue congestion built is still draining; adding to it
+        // now just refills it.
+        draining: gradient === "underusing",
       });
 
       // Ignore changes too small to matter: every adjustment reopens the

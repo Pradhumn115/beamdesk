@@ -306,3 +306,60 @@ test("congestion still cuts hard, regardless of what was measured", () => {
     400,
   );
 });
+
+/**
+ * Congestion should land the target where the link actually is, not step
+ * blindly down from wherever the target had drifted to.
+ *
+ * Against a link collapsing from 10Mbit/s to 800kbit/s the target sat at
+ * 20Mbit/s: at BITRATE_DOWN_FACTOR that is nine ticks, eighteen seconds of the
+ * encoder being told it may spend twenty times what the link can carry.
+ */
+test("congestion aims at the carried rate rather than stepping blindly down", () => {
+  const next = nextBitrateKbps({
+    previous: 20000,
+    congested: true,
+    ceilingKbps: 1_000_000,
+    provenKbps: 20000,
+    measuredKbps: 800, // what the link is really managing
+  });
+  assert.equal(next, 680, "0.85 of the carried rate, in one step");
+});
+
+test("an optimistic measurement cannot soften the response", () => {
+  // Measurement says the link is fine; congestion says otherwise. The blind
+  // step is the ceiling on the outcome, never the floor.
+  const next = nextBitrateKbps({
+    previous: 10000,
+    congested: true,
+    ceilingKbps: 1_000_000,
+    provenKbps: 20000,
+    measuredKbps: 50_000,
+  });
+  assert.equal(next, 6000, "falls back to the multiplicative step");
+});
+
+test("the floor still holds when the link is carrying almost nothing", () => {
+  assert.equal(
+    nextBitrateKbps({
+      previous: 2000,
+      congested: true,
+      ceilingKbps: 1_000_000,
+      provenKbps: 20000,
+      measuredKbps: 10,
+    }),
+    400,
+  );
+});
+
+test("the target holds while a queue is still draining", () => {
+  const next = nextBitrateKbps({
+    previous: 5000,
+    congested: false,
+    ceilingKbps: 1_000_000,
+    provenKbps: 20000,
+    measuredKbps: 5000,
+    draining: true,
+  });
+  assert.equal(next, 5000, "adding to a draining queue just refills it");
+});
