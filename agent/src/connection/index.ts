@@ -23,6 +23,7 @@ import type { InputLockManager } from "../inputlock/index.js";
 import { runDiagnostics } from "../diagnostics/index.js";
 import { TrendlineEstimator } from "./trendline.js";
 import { AckedRateTracker } from "./ackedrate.js";
+import { StuckBacklogDetector } from "./stuckbacklog.js";
 import { FramePacer } from "./pacer.js";
 import type { ClipboardBackend } from "../clipboard/index.js";
 
@@ -519,25 +520,6 @@ export function decideLadderMove(
   return { rung: state.rung, healthyChecks: 0, floorChecks: 0, moved: null };
 }
 
-/**
- * Queue depth that counts as "the link is behind".
- *
- * Deliberately below MAX_QUEUED_FRAME_BYTES: by the time frames are being
- * dropped the viewer has already seen the damage, so the controller reacts to
- * the queue growing rather than waiting for it to overflow.
- *
- * Compared against the STANDING queue — the shallowest depth seen during the
- * window — never the peak. Those are different quantities and confusing them
- * broke the controller outright: every GOP boundary emits an IDR carrying the
- * whole picture, which fills the queue for a few milliseconds and drains again
- * at once. Measured as a peak, that ordinary transient reported congestion on
- * EVERY tick, and since an IDR's size is set by the pixel count, lowering the
- * bitrate could not shrink it — so a pinned session ratcheted to the 400kbps
- * floor and stayed there for good on a link with ten times the headroom, with
- * no dropped frames and a healthy picture. A burst that drains is not
- * congestion; only a queue that never empties is.
- */
-const ADAPT_BACKLOG_BYTES = 192 * 1024;
 
 /**
  * Traces every adaptation tick, including the ones that change nothing.
@@ -609,6 +591,8 @@ export class ConnectionServer {
   private readonly trendline = new TrendlineEstimator();
   /** Highest frame seq the estimator has consumed; guards replayed feedback. */
   private lastFeedbackSeq = -1;
+  /** Refuses to believe a transport backlog that has stopped moving. */
+  private readonly stuckBacklog = new StuckBacklogDetector();
   /** What the CLIENT reports receiving; the anchor for the bitrate target. */
   private readonly ackedRate = new AckedRateTracker();
   /**
@@ -622,7 +606,8 @@ export class ConnectionServer {
   /**
    * SHALLOWEST queue depth seen since the last adaptation decision — the part
    * of the queue that never drained. This, not the peak, is the congestion
-   * signal; see ADAPT_BACKLOG_BYTES. `null` when no frame was captured during
+   * signal, kept for the trace now that congestion is decided by the receiver
+   * rather than by our own queue. `null` when no frame was captured during
    * the window, in which case the live depth is used instead.
    */
   private troughBacklog: number | null = null;
@@ -906,18 +891,21 @@ export class ConnectionServer {
       this.troughBacklog = null;
       this.dropsSinceAdapt = 0;
 
-      // Three independent witnesses, any of which is sufficient.
+      // Congestion is what the RECEIVER saw, plus frames we could not deliver.
       //
-      // The queue and the drop counter only ever see a bottleneck in OUR OWN
-      // send buffer. Anything further out -- a router, a tunnel, the far end's
-      // downlink -- is invisible to them: measured against a link collapsing
-      // from 10Mbit/s to 800kbit/s, both reported perfect health for the entire
-      // collapse while the delay gradient called it on six ticks out of seven.
-      // The gradient reads the receiver's arrival times, so it sees queueing
-      // wherever it happens, and sees it while the queue is still filling
-      // rather than once it has overflowed.
+      // Our own queue depth used to count too, and no longer does. It was never
+      // able to see a bottleneck further out than our own send buffer -- against
+      // a link collapsing from 10Mbit/s to 800kbit/s it reported perfect health
+      // throughout, while the gradient called it on six ticks out of seven --
+      // so it added nothing the gradient did not catch earlier. What it did add
+      // was a way to be wrong that a network measurement cannot be: it is local
+      // state, and a stranded write once left it frozen at 633KB for an entire
+      // session, which read as a permanently congested link and walked the
+      // picture from 1920p down to 320p. A signal that can only lag or lie is
+      // not worth consulting; `standing` is still logged, but it decides
+      // nothing.
       const gradient = this.trendline.current();
-      const congested = drops > 0 || standing > ADAPT_BACKLOG_BYTES || gradient === "overusing";
+      const congested = drops > 0 || gradient === "overusing";
       const ceiling = this.bitrateCeilingKbps();
 
       // Every tick, not just the ones that change something.
@@ -1367,11 +1355,22 @@ export class ConnectionServer {
       // not worth the JPEG encode. See MAX_QUEUED_FRAME_BYTES for why an
       // unbounded queue here made Classic drift permanently behind real time.
       const wtSend = this.deps.webtransport;
-      // The pacer's own queue counts. It sits in front of the transport, so
-      // measuring only the transport would let the capture loop encode happily
-      // into a backlog building one layer earlier.
-      const queued =
-        (wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount) + this.pacer.queuedBytes;
+      // Deciding not to encode a frame the transport cannot take is a
+      // legitimate local question, so the depth is still read here -- but a
+      // depth that never changes is not a queue, and believing one stopped the
+      // stream dead. See StuckBacklogDetector.
+      const reported = wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount;
+      const believable = this.stuckBacklog.trust(reported);
+      if (!believable && this.stuckBacklog.shouldReport()) {
+        process.stderr.write(
+          `[capture] transport backlog frozen at ${(reported / 1024).toFixed(0)}KB; ` +
+            `ignoring it as stale rather than starving the stream\n`,
+        );
+      }
+      // The pacer's own queue always counts. It sits in front of the transport,
+      // so measuring only the transport would let the capture loop encode
+      // happily into a backlog building one layer earlier.
+      const queued = (believable ? reported : 0) + this.pacer.queuedBytes;
       if (queued > this.peakBacklog) this.peakBacklog = queued;
       if (this.troughBacklog === null || queued < this.troughBacklog) this.troughBacklog = queued;
       const dropAbove =
