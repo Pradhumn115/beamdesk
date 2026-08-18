@@ -23,6 +23,7 @@ import type { InputLockManager } from "../inputlock/index.js";
 import { runDiagnostics } from "../diagnostics/index.js";
 import { TrendlineEstimator } from "./trendline.js";
 import { AckedRateTracker } from "./ackedrate.js";
+import { FramePacer } from "./pacer.js";
 import type { ClipboardBackend } from "../clipboard/index.js";
 
 export interface ServerDeps {
@@ -570,6 +571,14 @@ export class ConnectionServer {
   /** What the CLIENT reports receiving; the anchor for the bitrate target. */
   private readonly ackedRate = new AckedRateTracker();
   /**
+   * Smooths frames onto the wire. Constructed once and pointed at whichever
+   * transport is live at the moment each frame is released, so a session that
+   * gains or loses QUIC mid-stream keeps its pacing.
+   */
+  private readonly pacer = new FramePacer({
+    send: (frame) => this.sendPaced(frame),
+  });
+  /**
    * SHALLOWEST queue depth seen since the last adaptation decision — the part
    * of the queue that never drained. This, not the peak, is the congestion
    * signal; see ADAPT_BACKLOG_BYTES. `null` when no frame was captured during
@@ -830,6 +839,7 @@ export class ConnectionServer {
   private startAdapting(): void {
     if (this.adaptTimer || !this.deps.capture.setBitrate) return;
     this.bitrateKbps ??= this.deps.initialBitrateKbps ?? 2500;
+    this.pacer.setTargetKbps(this.bitrateKbps);
     // Open the measurement window HERE, not at construction. An agent that sat
     // idle for a minute before a viewer arrived otherwise divided the first
     // window's bytes by that whole minute, and the strip opened on a rate about
@@ -952,6 +962,7 @@ export class ConnectionServer {
       if (!tooSmall && next !== previous) {
         this.bitrateKbps = next;
         this.deps.capture.setBitrate?.(next);
+        this.pacer.setTargetKbps(next);
         process.stderr.write(
           `[adapt] ${previous} -> ${next} kbps ` +
             `(${congested ? `standing backlog ${(standing / 1024).toFixed(0)}KB (peak ${(peak / 1024).toFixed(0)}KB), ${drops} dropped` : "link healthy"})\n`,
@@ -1063,6 +1074,32 @@ export class ConnectionServer {
       if (Math.abs(ladder[i].width - width) < Math.abs(ladder[best].width - width)) best = i;
     }
     return best;
+  }
+
+  /**
+   * Puts one paced frame on whichever transport is carrying video.
+   *
+   * The transport is chosen at RELEASE time rather than at enqueue time: a
+   * frame may wait a few tens of milliseconds in the pacer, and a QUIC session
+   * can attach or die inside that window.
+   */
+  private sendPaced(frame: Uint8Array): void {
+    const ws = this.controller;
+    if (!ws || ws.readyState !== ws.OPEN) return;
+    // Counted once here rather than per transport: the same envelope goes over
+    // whichever one carries it, including the fallback below.
+    this.sentBytes += frame.byteLength;
+
+    const wt = this.deps.webtransport;
+    if (wt?.hasSession) {
+      void wt.send(frame).then((sent) => {
+        // Nobody actually took it (session died between the check and the
+        // write): fall back rather than silently dropping the frame.
+        if (!sent && ws.readyState === ws.OPEN) ws.send(frame, { binary: true });
+      });
+      return;
+    }
+    ws.send(frame, { binary: true });
   }
 
   /** Reports a buffering transition once, rather than on every frame. */
@@ -1271,7 +1308,11 @@ export class ConnectionServer {
       // not worth the JPEG encode. See MAX_QUEUED_FRAME_BYTES for why an
       // unbounded queue here made Classic drift permanently behind real time.
       const wtSend = this.deps.webtransport;
-      const queued = wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount;
+      // The pacer's own queue counts. It sits in front of the transport, so
+      // measuring only the transport would let the capture loop encode happily
+      // into a backlog building one layer earlier.
+      const queued =
+        (wtSend?.hasSession ? wtSend.backlogBytes : ws.bufferedAmount) + this.pacer.queuedBytes;
       if (queued > this.peakBacklog) this.peakBacklog = queued;
       if (this.troughBacklog === null || queued < this.troughBacklog) this.troughBacklog = queued;
       const dropAbove =
@@ -1306,24 +1347,10 @@ export class ConnectionServer {
         image.keyframe ?? true,
       );
 
-      // Prefer QUIC when a client is attached to it: each frame gets its own
-      // stream, so loss in one never blocks the next, which TCP cannot offer.
-      // The same envelope goes over either transport, so the client decodes
-      // identically and the fallback is invisible.
-      // Counted once here rather than per transport: the same envelope goes
-      // over whichever one carries it, including the fallback below.
-      this.sentBytes += buf.byteLength;
-
-      const wt = this.deps.webtransport;
-      if (wt?.hasSession) {
-        void wt.send(new Uint8Array(buf)).then((sent) => {
-          // Nobody actually took it (session died between the check and the
-          // write): fall back rather than silently dropping the frame.
-          if (!sent && ws.readyState === ws.OPEN) ws.send(buf, { binary: true });
-        });
-        return;
-      }
-      ws.send(buf, { binary: true });
+      // Metered out rather than handed over whole; see FramePacer for why an
+      // unpaced keyframe is indistinguishable, at the receiver, from the link
+      // stalling. The pacer decides WHEN, not whether: it never discards.
+      this.pacer.enqueue(new Uint8Array(buf));
     });
   }
 
