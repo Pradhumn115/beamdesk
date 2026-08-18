@@ -273,6 +273,18 @@ export function screenCaptureInputArgs(fps: number): string[] {
       return [
         "-f", "avfoundation",
         "-capture_cursor", "1",
+        // Ask for what the device actually offers.
+        //
+        // ffmpeg's avfoundation demuxer defaults its `pixel_format` to
+        // yuv420p, and a ScreenCaptureKit display offers only uyvy422,
+        // yuyv422, nv12, 0rgb and bgr0 -- so it refused to open at all:
+        // "Selected pixel format (yuv420p) is not supported by the input
+        // device". That killed the MJPEG path outright on any Mac using
+        // ScreenCaptureKit; the fallback spawned, emitted no frames, and the
+        // viewer got a permanently blank stream. The filter chain and the
+        // mjpeg encoder convert from here, so nothing downstream cares.
+        // See H264Capture, which requests nv12 for the same reason.
+        "-pixel_format", "nv12",
         "-framerate", String(fps),
         "-i", `${macScreenDevice()}:none`,
       ];
@@ -309,16 +321,30 @@ let cachedMacDevice: string | null = null;
  */
 function macScreenDevice(): string {
   if (cachedMacDevice !== null) return cachedMacDevice;
-  cachedMacDevice = "1";
   try {
     const res = spawnSync("ffmpeg", ["-f", "avfoundation", "-list_devices", "true", "-i", ""], {
       encoding: "utf8",
     });
     const text = `${res.stdout ?? ""}${res.stderr ?? ""}`;
     const m = text.match(/\[(\d+)\]\s+Capture screen 0/i);
-    if (m) cachedMacDevice = m[1];
-  } catch {
-    /* keep fallback */
+    // Only a SUCCESSFUL probe is cached.
+    //
+    // The fallback used to be cached too, and the enumeration is not reliably
+    // available at startup — a display still being released by a previous
+    // capture drops out of the list for a few seconds. One unlucky probe
+    // therefore pinned device "1" (a camera, on most Macs) for the entire
+    // session: ffmpeg opened happily, the log stayed clean, and the viewer got
+    // a stream that never produced a single frame. Retrying costs one spawn on
+    // a path that has already failed, and the next attempt usually succeeds.
+    if (m) {
+      cachedMacDevice = m[1];
+      return cachedMacDevice;
+    }
+    process.stderr.write(
+      "[capture] avfoundation did not list a screen device; retrying on the next spawn\n",
+    );
+  } catch (err) {
+    process.stderr.write(`[capture] could not enumerate avfoundation devices: ${String(err)}\n`);
   }
-  return cachedMacDevice;
+  return "1";
 }
